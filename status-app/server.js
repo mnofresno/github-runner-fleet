@@ -143,6 +143,44 @@ async function getRunnerContainer() {
   return response.body[0] || null;
 }
 
+async function listRunJobs(runId) {
+  const jobs = await github(`/repos/${owner}/${repo}/actions/runs/${runId}/jobs`);
+  return (jobs.jobs || []).map((job) => ({
+    id: job.id,
+    name: job.name,
+    status: job.status,
+    conclusion: job.conclusion,
+    started_at: job.started_at,
+    completed_at: job.completed_at,
+    runner_name: job.runner_name,
+    html_url: job.html_url,
+  }));
+}
+
+async function rerunWorkflowRun(runId) {
+  const response = await githubRaw(`/repos/${owner}/${repo}/actions/runs/${runId}/rerun`, { method: 'POST' });
+  if (![201, 202].includes(response.statusCode)) {
+    throw new Error(`Run rerun failed with status ${response.statusCode}`);
+  }
+  return { runId, scope: 'run', statusCode: response.statusCode };
+}
+
+async function rerunFailedJobs(runId) {
+  const response = await githubRaw(`/repos/${owner}/${repo}/actions/runs/${runId}/rerun-failed-jobs`, { method: 'POST' });
+  if (![201, 202].includes(response.statusCode)) {
+    throw new Error(`Failed-jobs rerun failed with status ${response.statusCode}`);
+  }
+  return { runId, scope: 'failed-jobs', statusCode: response.statusCode };
+}
+
+async function rerunJob(jobId) {
+  const response = await githubRaw(`/repos/${owner}/${repo}/actions/jobs/${jobId}/rerun`, { method: 'POST' });
+  if (![201, 202].includes(response.statusCode)) {
+    throw new Error(`Job rerun failed with status ${response.statusCode}`);
+  }
+  return { jobId, scope: 'job', statusCode: response.statusCode };
+}
+
 async function forceCancelRun(runId) {
   const result = {
     runId,
@@ -197,10 +235,15 @@ function render(status) {
     ? status.activeJobs.map((job) => `<tr><td>${escapeHtml(job.name)}</td><td>${escapeHtml(job.status)}</td><td>${escapeHtml(job.conclusion || '-')}</td><td>${escapeHtml(job.runner_name || '-')}</td></tr>`).join('')
     : '<tr><td colspan="4">No active jobs</td></tr>';
   const runs = status.latestRuns.map((run) => {
-    const action = run.status !== 'completed'
-      ? `<button class="danger" data-run-id="${escapeHtml(run.id)}">Force cancel</button>`
-      : '';
-    return `<tr><td><a href="${escapeHtml(run.url)}" target="_blank" rel="noreferrer">${run.id}</a></td><td>${escapeHtml(run.event)}</td><td>${escapeHtml(run.status)}</td><td>${escapeHtml(run.conclusion || '-')}</td><td>${escapeHtml(run.created_at)}</td><td>${action}</td></tr>`;
+    const actions = [];
+    if (run.status !== 'completed') {
+      actions.push(`<button class="danger" data-run-id="${escapeHtml(run.id)}" data-action="force-cancel">Force cancel</button>`);
+    } else {
+      actions.push(`<button data-run-id="${escapeHtml(run.id)}" data-action="show-jobs">Jobs</button>`);
+      actions.push(`<button data-run-id="${escapeHtml(run.id)}" data-action="rerun-run">Rerun all</button>`);
+      actions.push(`<button data-run-id="${escapeHtml(run.id)}" data-action="rerun-failed">Rerun failed</button>`);
+    }
+    return `<tr><td><a href="${escapeHtml(run.url)}" target="_blank" rel="noreferrer">${run.id}</a></td><td>${escapeHtml(run.event)}</td><td>${escapeHtml(run.status)}</td><td>${escapeHtml(run.conclusion || '-')}</td><td>${escapeHtml(run.created_at)}</td><td><div class="actions">${actions.join('')}</div></td></tr>`;
   }).join('');
 
   return `<!doctype html>
@@ -229,6 +272,7 @@ function render(status) {
     button:disabled { opacity: 0.6; cursor: wait; }
     button.danger { border-color: #7f1d1d; background: #3a1414; color: #fecaca; }
     button.danger:hover { background: #4a1717; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     code { background: #101214; border: 1px solid #2a2f36; border-radius: 6px; padding: 2px 6px; }
     #action-status { min-height: 20px; }
   </style>
@@ -238,7 +282,7 @@ function render(status) {
     <div class="card">
       <div class="stack">
         <h1>GitHub Self-Hosted Runner</h1>
-        ${activeRun ? `<button class="danger" data-run-id="${escapeHtml(activeRun.id)}">Force cancel active run</button>` : ''}
+        ${activeRun ? `<button class="danger" data-run-id="${escapeHtml(activeRun.id)}" data-action="force-cancel">Force cancel active run</button>` : ''}
       </div>
       <p>Repository: <strong>${escapeHtml(status.repository)}</strong></p>
       <p>Generated: <code>${escapeHtml(status.generatedAt)}</code></p>
@@ -251,6 +295,7 @@ function render(status) {
     </div>
     <div class="card">
       <h2>Active Jobs</h2>
+      <p class="muted">GitHub exposes cancel at run level. Specific jobs can be re-run, not cleanly canceled on their own.</p>
       <table>
         <thead><tr><th>Job</th><th>Status</th><th>Conclusion</th><th>Runner</th></tr></thead>
         <tbody>${jobs}</tbody>
@@ -263,36 +308,133 @@ function render(status) {
         <tbody>${runs}</tbody>
       </table>
     </div>
+    <div class="card">
+      <h2>Selected Run Jobs</h2>
+      <p class="muted">Choose a completed run to inspect its jobs and re-run individual parts.</p>
+      <div id="jobs-panel" class="muted">No run selected.</div>
+    </div>
   </div>
   <script>
     const statusNode = document.getElementById('action-status');
+    const jobsPanel = document.getElementById('jobs-panel');
     const buttons = Array.from(document.querySelectorAll('button[data-run-id]'));
 
-    async function forceCancel(runId, button) {
+    function setBusy(disabled) {
+      buttons.forEach((item) => { item.disabled = disabled; });
+    }
+
+    async function callJson(url) {
+      const response = await fetch(url);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || 'Unknown error');
+      }
+      return payload;
+    }
+
+    async function forceCancel(runId) {
       const confirmed = window.confirm('This sends GitHub force-cancel and SIGKILL to the runner container. Continue?');
       if (!confirmed) {
         return;
       }
 
-      buttons.forEach((item) => { item.disabled = true; });
+      setBusy(true);
       statusNode.textContent = 'Sending force cancel...';
 
       try {
-        const response = await fetch('/api/runs/' + runId + '/force-cancel');
-        const payload = await response.json();
-        if (!response.ok) {
-          throw new Error(payload.error || 'Unknown error');
-        }
+        await callJson('/api/runs/' + runId + '/force-cancel');
         statusNode.textContent = 'Force cancel sent for run ' + runId + '. Reloading...';
         window.setTimeout(() => window.location.reload(), 1800);
       } catch (error) {
         statusNode.textContent = 'Force cancel failed: ' + error.message;
-        buttons.forEach((item) => { item.disabled = false; });
+        setBusy(false);
+      }
+    }
+
+    function renderJobs(runId, jobs) {
+      if (!jobs.length) {
+        jobsPanel.innerHTML = '<p class="muted">Run ' + runId + ' has no jobs.</p>';
+        return;
+      }
+
+      const rows = jobs.map((job) => {
+        return '<tr>'
+          + '<td><a href="' + job.html_url + '" target="_blank" rel="noreferrer">' + job.name + '</a></td>'
+          + '<td>' + (job.status || '-') + '</td>'
+          + '<td>' + (job.conclusion || '-') + '</td>'
+          + '<td>' + (job.runner_name || '-') + '</td>'
+          + '<td><button data-job-id="' + job.id + '" data-action="rerun-job">Rerun job</button></td>'
+          + '</tr>';
+      }).join('');
+
+      jobsPanel.innerHTML = '<table><thead><tr><th>Job</th><th>Status</th><th>Conclusion</th><th>Runner</th><th>Action</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      Array.from(jobsPanel.querySelectorAll('button[data-job-id]')).forEach((button) => {
+        button.addEventListener('click', () => rerunJob(button.dataset.jobId));
+      });
+    }
+
+    async function showJobs(runId) {
+      jobsPanel.textContent = 'Loading jobs for run ' + runId + '...';
+      try {
+        const jobs = await callJson('/api/runs/' + runId + '/jobs');
+        renderJobs(runId, jobs);
+      } catch (error) {
+        jobsPanel.textContent = 'Could not load jobs: ' + error.message;
+      }
+    }
+
+    async function rerunRun(runId) {
+      setBusy(true);
+      statusNode.textContent = 'Sending rerun for run ' + runId + '...';
+      try {
+        await callJson('/api/runs/' + runId + '/rerun');
+        statusNode.textContent = 'Rerun requested for run ' + runId + '.';
+      } catch (error) {
+        statusNode.textContent = 'Rerun failed: ' + error.message;
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function rerunFailed(runId) {
+      setBusy(true);
+      statusNode.textContent = 'Sending rerun for failed jobs in run ' + runId + '...';
+      try {
+        await callJson('/api/runs/' + runId + '/rerun-failed');
+        statusNode.textContent = 'Failed jobs rerun requested for run ' + runId + '.';
+      } catch (error) {
+        statusNode.textContent = 'Failed jobs rerun failed: ' + error.message;
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function rerunJob(jobId) {
+      setBusy(true);
+      statusNode.textContent = 'Sending rerun for job ' + jobId + '...';
+      try {
+        await callJson('/api/jobs/' + jobId + '/rerun');
+        statusNode.textContent = 'Job rerun requested for job ' + jobId + '.';
+      } catch (error) {
+        statusNode.textContent = 'Job rerun failed: ' + error.message;
+      } finally {
+        setBusy(false);
       }
     }
 
     buttons.forEach((button) => {
-      button.addEventListener('click', () => forceCancel(button.dataset.runId, button));
+      button.addEventListener('click', () => {
+        const action = button.dataset.action;
+        if (action === 'force-cancel') {
+          forceCancel(button.dataset.runId);
+        } else if (action === 'show-jobs') {
+          showJobs(button.dataset.runId);
+        } else if (action === 'rerun-run') {
+          rerunRun(button.dataset.runId);
+        } else if (action === 'rerun-failed') {
+          rerunFailed(button.dataset.runId);
+        }
+      });
     });
   </script>
 </body>
@@ -303,9 +445,41 @@ const server = http.createServer(async (req, res) => {
   try {
     const requestUrl = new URL(req.url, 'http://localhost');
     const forceCancelMatch = requestUrl.pathname.match(/^\/api\/runs\/(\d+)\/force-cancel$/);
+    const runJobsMatch = requestUrl.pathname.match(/^\/api\/runs\/(\d+)\/jobs$/);
+    const rerunRunMatch = requestUrl.pathname.match(/^\/api\/runs\/(\d+)\/rerun$/);
+    const rerunFailedMatch = requestUrl.pathname.match(/^\/api\/runs\/(\d+)\/rerun-failed$/);
+    const rerunJobMatch = requestUrl.pathname.match(/^\/api\/jobs\/(\d+)\/rerun$/);
 
     if (forceCancelMatch) {
       const result = await forceCancelRun(forceCancelMatch[1]);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (runJobsMatch) {
+      const jobs = await listRunJobs(runJobsMatch[1]);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(jobs));
+      return;
+    }
+
+    if (rerunRunMatch) {
+      const result = await rerunWorkflowRun(rerunRunMatch[1]);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (rerunFailedMatch) {
+      const result = await rerunFailedJobs(rerunFailedMatch[1]);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (rerunJobMatch) {
+      const result = await rerunJob(rerunJobMatch[1]);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(result));
       return;
