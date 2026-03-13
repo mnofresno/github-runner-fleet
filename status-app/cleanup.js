@@ -111,12 +111,11 @@ function buildCleanupPlan({ status, dockerContainers, now = Date.now() }) {
 
 async function pruneDanglingResources(docker) {
   const imageFilters = encodeURIComponent(JSON.stringify({ dangling: { true: true }, until: { [DEFAULT_DANGLING_MAX_AGE]: true } }));
-  const volumeFilters = encodeURIComponent(JSON.stringify({ dangling: { true: true } }));
   const buildFilters = encodeURIComponent(JSON.stringify({ until: { [DEFAULT_BUILD_CACHE_MAX_AGE]: true } }));
 
   const [images, volumes, buildCache] = await Promise.all([
     docker(`/images/prune?filters=${imageFilters}`, { method: 'POST' }),
-    docker(`/volumes/prune?filters=${volumeFilters}`, { method: 'POST' }),
+    docker('/volumes/prune', { method: 'POST' }),
     docker(`/build/prune?filters=${buildFilters}`, { method: 'POST' }),
   ]);
 
