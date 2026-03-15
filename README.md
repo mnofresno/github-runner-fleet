@@ -94,29 +94,42 @@ Example:
 
 ```yaml
 services:
-  runner-gymnerd:
+  runner-persistent:
     image: ${RUNNER_IMAGE:-myoung34/github-runner:latest}
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      RUNNER_NAME: gymnerd-org-runner-1
-      RUNNER_SCOPE: org
-      ORG_NAME: gymnerd-ar
-      LABELS: self-hosted,linux,x64,gymnerd,shared
+      RUNNER_NAME: ${PERSISTENT_RUNNER_NAME}
+      RUNNER_SCOPE: ${PERSISTENT_RUNNER_SCOPE:-org}
+      ORG_NAME: ${PERSISTENT_ORG_NAME}
+      REPO_URL: ${PERSISTENT_REPO_URL:-}
+      LABELS: ${PERSISTENT_LABELS}
       DISABLE_AUTO_UPDATE: 'true'
       EPHEMERAL: 'true'
-      RUNNER_WORKDIR: /tmp/github-runner
+      RUNNER_WORKDIR: ${PERSISTENT_RUNNER_WORKDIR:-/tmp/github-runner}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /tmp/github-runner-gymnerd:/tmp/github-runner
+      - ${PERSISTENT_HOST_WORKDIR:-/tmp/github-runner-persistent}:${PERSISTENT_RUNNER_WORKDIR:-/tmp/github-runner}
 ```
+
+Set the values in a local `.env` or deployment secret store, for example:
+
+```env
+PERSISTENT_RUNNER_NAME=critical-org-runner-1
+PERSISTENT_RUNNER_SCOPE=org
+PERSISTENT_ORG_NAME=your-org
+PERSISTENT_LABELS=self-hosted,linux,x64,critical,shared
+PERSISTENT_HOST_WORKDIR=/tmp/github-runner-critical
+```
+
+For repo scope, leave `PERSISTENT_ORG_NAME` empty and set `PERSISTENT_REPO_URL=https://github.com/owner/repo`.
 
 Then start it with:
 
 ```bash
 cp docker-compose.override.example.yml docker-compose.override.yml
-docker compose up -d runner-gymnerd
+docker compose up -d runner-persistent
 ```
 
 Each runner is registered in exactly one scope. Do not try to register one persistent runner across multiple organizations.
