@@ -1,0 +1,33 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger production auto-deploy
+        env:
+          AUTODEPLOY_URL: https://git-autodeploy.fresno.ar
+          DEPLOY_KEY: id_bpf_app
+          REPOSITORY: github-runner-fleet
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_AUTHOR: ${{ github.actor }}
+        run: |
+          curl --fail --show-error --silent \
+            -H "Content-Type: application/json" \
+            -X POST \
+            "${AUTODEPLOY_URL}?repo=${REPOSITORY}&key=${DEPLOY_KEY}" \
+            -d @- <<EOF
+          {
+            "key": "${DEPLOY_KEY}",
+            "run_in_background": true,
+            "commit": {
+              "sha": "${COMMIT_SHA}",
+              "author": "${COMMIT_AUTHOR}"
+            }
+          }
+          EOF
