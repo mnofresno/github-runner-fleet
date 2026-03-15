@@ -4,9 +4,10 @@ const { URL } = require('url');
 
 const DEFAULT_PORT = 8080;
 const DEFAULT_WORKDIR = '/tmp/github-runner';
-const DEFAULT_COMPOSE_PROJECT_NAME = 'github-runner-fleet';
 const DEFAULT_DIND_IMAGE = 'docker:27-dind';
-const LEGACY_COMPOSE_PROJECT_NAME = 'github-selfhosted';
+const DEFAULT_RECONCILE_INTERVAL_MS = Number.parseInt(process.env.RECONCILE_INTERVAL_MS || '5000', 10);
+const DEFAULT_STACK_GRACE_MS = Number.parseInt(process.env.STACK_GRACE_MS || '30000', 10);
+const DEFAULT_MAX_RUNNERS_PER_TARGET = Math.max(1, Number.parseInt(process.env.MAX_RUNNERS_PER_TARGET || '2', 10));
 const MANAGED_LABEL = 'io.github-runner-fleet.managed';
 const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
 const MANAGED_RUNNER_LABEL = 'io.github-runner-fleet.runner-name';
@@ -15,7 +16,6 @@ const MANAGED_STACK_LABEL = 'io.github-runner-fleet.stack-id';
 const LEGACY_MANAGED_LABEL = 'io.github-selfhosted.managed';
 const LEGACY_MANAGED_TARGET_LABEL = 'io.github-selfhosted.target-id';
 const LEGACY_MANAGED_RUNNER_LABEL = 'io.github-selfhosted.runner-name';
-const STATIC_RUNNER_LABEL = 'com.docker.compose.service=runner';
 
 function collectJson(res, resolve, reject) {
   let data = '';
@@ -135,25 +135,6 @@ function isManagedRunnerResource(labels) {
   return labels?.[LEGACY_MANAGED_LABEL] === 'true';
 }
 
-function acceptedComposeProjects() {
-  return new Set([
-    process.env.COMPOSE_PROJECT_NAME || DEFAULT_COMPOSE_PROJECT_NAME,
-    LEGACY_COMPOSE_PROJECT_NAME,
-  ]);
-}
-
-function isPersistentComposeRunner(labels) {
-  const service = labels?.['com.docker.compose.service'] || '';
-  const project = labels?.['com.docker.compose.project'] || '';
-  if (!acceptedComposeProjects().has(project)) {
-    return false;
-  }
-  if (!service.startsWith('runner')) {
-    return false;
-  }
-  return !service.endsWith('-dind') && service !== 'runner-status';
-}
-
 function slugify(value) {
   return String(value || '')
     .trim()
@@ -210,6 +191,11 @@ function normalizeTarget(input, env, index) {
   const workdir = input.runnerWorkdir || input.RUNNER_WORKDIR || env.RUNNER_WORKDIR || DEFAULT_WORKDIR;
   const dindImage = input.dindImage || input.DIND_IMAGE || env.DIND_IMAGE || DEFAULT_DIND_IMAGE;
   const name = input.name || id;
+  const parsedMaxRunners = Number.parseInt(
+    input.maxRunners || input.MAX_RUNNERS_PER_TARGET || env.MAX_RUNNERS_PER_TARGET || DEFAULT_MAX_RUNNERS_PER_TARGET,
+    10,
+  );
+  const maxRunners = Math.max(1, Number.isNaN(parsedMaxRunners) ? DEFAULT_MAX_RUNNERS_PER_TARGET : parsedMaxRunners);
 
   if (!id) {
     throw new Error(`Runner target #${index + 1} is missing an id or name`);
@@ -239,6 +225,7 @@ function normalizeTarget(input, env, index) {
     runnerImage: image,
     runnerWorkdir: workdir,
     dindImage,
+    maxRunners,
     runnerGroup: input.runnerGroup || input.RUNNER_GROUP || '',
     runnerNamePrefix: slugify(input.runnerNamePrefix || `${id}-runner`) || 'runner',
     default: Boolean(input.default),
@@ -274,63 +261,41 @@ function getTargetMap(targets) {
   return new Map(targets.map((target) => [target.id, target]));
 }
 
-function envMap(entries) {
-  return Object.fromEntries((entries || []).map((entry) => {
-    const separator = entry.indexOf('=');
-    if (separator === -1) {
-      return [entry, ''];
-    }
-    return [entry.slice(0, separator), entry.slice(separator + 1)];
-  }));
-}
-
 function targetHasRepoFeed(target) {
   return Boolean(target.owner && target.repo);
 }
 
-function targetMatchesPersistentRunner(target, env) {
-  const runnerScope = String(env.RUNNER_SCOPE || '').toLowerCase();
-  const runnerLabels = new Set(parseLabels(env.LABELS));
-  const parsedRepo = parseRepoUrl(env.REPO_URL || '');
-  const runnerOwner = env.ORG_NAME || parsedRepo.owner;
-  const runnerRepo = parsedRepo.repo;
-
-  if (runnerScope && runnerScope !== target.scope) {
-    return false;
-  }
-  if (runnerOwner && runnerOwner !== target.owner) {
-    return false;
-  }
-  if (target.repo && runnerRepo && runnerRepo !== target.repo) {
-    return false;
-  }
-
-  const customTargetLabels = target.labels.filter((label) => !['self-hosted', 'linux', 'x64'].includes(label.toLowerCase()));
-  if (!customTargetLabels.length) {
-    return true;
-  }
-  return customTargetLabels.every((label) => runnerLabels.has(label));
+function managedStackValue(labels) {
+  return labels?.[MANAGED_STACK_LABEL]
+    || labels?.['io.github-selfhosted.stack-id']
+    || labels?.[MANAGED_RUNNER_LABEL]
+    || labels?.[LEGACY_MANAGED_RUNNER_LABEL]
+    || '';
 }
 
-async function inspectContainerEnvs(containerIds) {
-  const inspected = await Promise.all(containerIds.map(async (containerId) => {
-    const response = await docker(`/containers/${containerId}/json`);
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw new Error(`Container inspect failed with status ${response.statusCode}`);
+function parseCreatedMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 1e12 ? value : value * 1000;
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
     }
-    return response.body;
-  }));
-  return new Map(inspected.map((container) => [container.Id, envMap(container.Config?.Env)]));
+  }
+
+  return 0;
 }
 
-async function listManagedRunnerContainers(targetId, target = null) {
+async function listManagedContainers() {
   const response = await docker('/containers/json?all=1');
   if (response.statusCode < 200 || response.statusCode >= 300) {
     throw new Error(`Docker API ${response.statusCode}`);
   }
 
-  const managed = response.body
-    .filter((container) => isManagedRunnerResource(container.Labels))
+  return response.body
+    .filter((container) => isManagedResource(container.Labels))
     .map((container) => ({
       id: container.Id,
       shortId: container.Id.slice(0, 12),
@@ -339,51 +304,147 @@ async function listManagedRunnerContainers(targetId, target = null) {
       state: container.State,
       status: container.Status,
       created: container.Created,
+      createdMs: parseCreatedMs(container.Created),
       targetId: managedLabelValue(container.Labels, MANAGED_TARGET_LABEL, LEGACY_MANAGED_TARGET_LABEL),
       runnerName: managedLabelValue(container.Labels, MANAGED_RUNNER_LABEL, LEGACY_MANAGED_RUNNER_LABEL),
-      persistent: false,
+      role: container.Labels?.[MANAGED_ROLE_LABEL] || (isManagedRunnerResource(container.Labels) ? 'runner' : 'resource'),
+      stackId: managedStackValue(container.Labels) || container.Id,
     }));
-
-  const persistentCandidates = response.body.filter((container) => isPersistentComposeRunner(container.Labels));
-  const persistentEnvs = persistentCandidates.length ? await inspectContainerEnvs(persistentCandidates.map((container) => container.Id)) : new Map();
-  const persistent = persistentCandidates
-    .filter((container) => {
-      if (!target) {
-        return false;
-      }
-      return targetMatchesPersistentRunner(target, persistentEnvs.get(container.Id) || {});
-    })
-    .map((container) => {
-      const containerEnv = persistentEnvs.get(container.Id) || {};
-      return {
-        id: container.Id,
-        shortId: container.Id.slice(0, 12),
-        name: (container.Names?.[0] || '').replace(/^\//, ''),
-        image: container.Image,
-        state: container.State,
-        status: container.Status,
-        created: container.Created,
-        targetId: target?.id || '',
-        runnerName: containerEnv.RUNNER_NAME || (container.Names?.[0] || '').replace(/^\//, ''),
-        persistent: true,
-      };
-    });
-
-  return [...managed, ...persistent]
-    .filter((container) => !targetId || container.targetId === targetId);
 }
 
-async function getStaticRunnerContainer() {
-  const response = await docker('/containers/json?all=1');
+async function listManagedVolumes() {
+  const response = await docker('/volumes');
   if (response.statusCode < 200 || response.statusCode >= 300) {
     throw new Error(`Docker API ${response.statusCode}`);
   }
-  const acceptedProjects = acceptedComposeProjects();
 
-  return response.body.find((container) => (
-    container.Labels?.['com.docker.compose.service'] === 'runner'
-    && acceptedProjects.has(container.Labels?.['com.docker.compose.project'])
-  )) || null;
+  return (response.body.Volumes || [])
+    .filter((volume) => isManagedResource(volume.Labels))
+    .map((volume) => ({
+      ...volume,
+      createdMs: parseCreatedMs(volume.CreatedAt),
+      targetId: managedLabelValue(volume.Labels, MANAGED_TARGET_LABEL, LEGACY_MANAGED_TARGET_LABEL),
+      runnerName: managedLabelValue(volume.Labels, MANAGED_RUNNER_LABEL, LEGACY_MANAGED_RUNNER_LABEL),
+      stackId: managedStackValue(volume.Labels) || volume.Name,
+    }));
+}
+
+async function listManagedNetworks() {
+  const response = await docker('/networks');
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Docker API ${response.statusCode}`);
+  }
+
+  return response.body
+    .filter((network) => isManagedResource(network.Labels))
+    .map((network) => ({
+      ...network,
+      createdMs: parseCreatedMs(network.Created),
+      targetId: managedLabelValue(network.Labels, MANAGED_TARGET_LABEL, LEGACY_MANAGED_TARGET_LABEL),
+      runnerName: managedLabelValue(network.Labels, MANAGED_RUNNER_LABEL, LEGACY_MANAGED_RUNNER_LABEL),
+      stackId: managedStackValue(network.Labels) || network.Name,
+    }));
+}
+
+function groupManagedStacks(containers, volumes = [], networks = []) {
+  const stacks = new Map();
+
+  function ensureStack(resource) {
+    const stackId = resource.stackId || resource.id || resource.Name;
+    const existing = stacks.get(stackId);
+    if (existing) {
+      if (!existing.targetId && resource.targetId) {
+        existing.targetId = resource.targetId;
+      }
+      if (!existing.runnerName && resource.runnerName) {
+        existing.runnerName = resource.runnerName;
+      }
+      if (resource.createdMs && (!existing.createdMs || resource.createdMs < existing.createdMs)) {
+        existing.createdMs = resource.createdMs;
+      }
+      return existing;
+    }
+
+    const createdMs = resource.createdMs || 0;
+    const stack = {
+      stackId,
+      targetId: resource.targetId || '',
+      runnerName: resource.runnerName || '',
+      createdMs,
+      containers: [],
+      volumes: [],
+      networks: [],
+      runnerContainer: null,
+      dindContainer: null,
+    };
+    stacks.set(stackId, stack);
+    return stack;
+  }
+
+  for (const container of containers) {
+    const stack = ensureStack(container);
+    stack.containers.push(container);
+    if (container.role === 'runner') {
+      stack.runnerContainer = container;
+    }
+    if (container.role === 'dind') {
+      stack.dindContainer = container;
+    }
+  }
+
+  for (const volume of volumes) {
+    const stack = ensureStack(volume);
+    stack.volumes.push(volume);
+  }
+
+  for (const network of networks) {
+    const stack = ensureStack(network);
+    stack.networks.push(network);
+  }
+
+  return Array.from(stacks.values())
+    .map((stack) => ({
+      ...stack,
+      createdMs: stack.createdMs || 0,
+      state: stack.runnerContainer?.state || stack.dindContainer?.state || 'unknown',
+      status: stack.runnerContainer?.status || stack.dindContainer?.status || 'unknown',
+      name: stack.runnerContainer?.name || stack.runnerName || stack.stackId,
+    }))
+    .sort((left, right) => (left.createdMs || 0) - (right.createdMs || 0));
+}
+
+function localRunnersFromStacks(targetId, stacks) {
+  return stacks
+    .filter((stack) => !targetId || stack.targetId === targetId)
+    .map((stack) => ({
+      id: stack.runnerContainer?.id || stack.stackId,
+      shortId: (stack.runnerContainer?.shortId || stack.stackId).slice(0, 12),
+      name: stack.name,
+      image: stack.runnerContainer?.image || '',
+      state: stack.state,
+      status: stack.status,
+      created: Math.floor((stack.createdMs || 0) / 1000),
+      createdMs: stack.createdMs || 0,
+      targetId: stack.targetId,
+      runnerName: stack.runnerName,
+      stackId: stack.stackId,
+      networkName: stack.networks[0]?.Name || '',
+      volumeNames: stack.volumes.map((volume) => volume.Name),
+    }));
+}
+
+async function listManagedStacks() {
+  const [containers, volumes, networks] = await Promise.all([
+    listManagedContainers(),
+    listManagedVolumes(),
+    listManagedNetworks(),
+  ]);
+
+  return groupManagedStacks(containers, volumes, networks);
+}
+
+async function listManagedRunnerContainers(targetId) {
+  return localRunnersFromStacks(targetId, await listManagedStacks());
 }
 
 function formatRunnerName(target) {
@@ -778,34 +839,116 @@ async function rerunJob(target, jobId) {
   return { jobId, scope: 'job', statusCode: response.statusCode };
 }
 
+function activeRunsFromLatestRuns(latestRuns) {
+  return latestRuns.filter((run) => run.status !== 'completed');
+}
+
+async function activeJobsFromRuns(target, runs) {
+  const runJobs = await Promise.all(runs.map((run) => listRunJobs(target, run.id)));
+  return runJobs
+    .flat()
+    .filter((job) => job.status !== 'completed');
+}
+
+function desiredRunnerCountForTarget({ target, activeRuns, activeJobs, managedStacks = [] }) {
+  const managedRunnerNames = new Set(managedStacks.map((stack) => stack.runnerName).filter(Boolean));
+  const queuedJobs = activeJobs.filter((job) => !job.runner_name);
+  const assignedManagedJobs = activeJobs.filter((job) => managedRunnerNames.has(job.runner_name));
+  let desired = queuedJobs.length + assignedManagedJobs.length;
+
+  if (desired === 0 && activeRuns.length) {
+    desired = managedStacks.length ? managedStacks.length : 1;
+  }
+
+  return Math.min(target.maxRunners || DEFAULT_MAX_RUNNERS_PER_TARGET, desired);
+}
+
+function shouldRemoveManagedStack(stack, snapshot, { now = Date.now(), graceMs = DEFAULT_STACK_GRACE_MS } = {}) {
+  const runnerState = String(stack.runnerContainer?.state || '').toLowerCase();
+  const dindState = String(stack.dindContainer?.state || '').toLowerCase();
+  const ageMs = Math.max(0, now - (stack.createdMs || now));
+
+  if (!stack.runnerContainer || !stack.dindContainer) {
+    return true;
+  }
+
+  if (['dead', 'exited', 'removing'].includes(runnerState) || ['dead', 'exited', 'removing'].includes(dindState)) {
+    return true;
+  }
+
+  if (!snapshot.activeRuns.length) {
+    return ageMs >= graceMs;
+  }
+
+  const activeRunnerNames = new Set(snapshot.activeJobs.map((job) => job.runner_name).filter(Boolean));
+  if (activeRunnerNames.has(stack.runnerName)) {
+    return false;
+  }
+
+  return ageMs >= graceMs && snapshot.managedStacks.length > snapshot.desiredRunnerCount;
+}
+
+async function collectTargetSnapshot(target, allStacks = null) {
+  const [githubRunners, latestRuns, managedStacksAll] = await Promise.all([
+    githubRunnersForTarget(target),
+    latestRunsForTarget(target),
+    allStacks ? Promise.resolve(allStacks) : listManagedStacks(),
+  ]);
+
+  const managedStacks = managedStacksAll.filter((stack) => stack.targetId === target.id);
+  const activeRuns = activeRunsFromLatestRuns(latestRuns);
+  const activeJobs = activeRuns.length ? await activeJobsFromRuns(target, activeRuns) : [];
+  const desiredRunnerCount = desiredRunnerCountForTarget({
+    target,
+    activeRuns,
+    activeJobs,
+    managedStacks,
+  });
+
+  return {
+    id: target.id,
+    name: target.name,
+    scope: target.scope,
+    owner: target.owner,
+    repo: target.repo,
+    repository: targetHasRepoFeed(target) ? `${target.owner}/${target.repo}` : target.owner,
+    description: target.description,
+    labels: target.labels,
+    maxRunners: target.maxRunners,
+    managedStacks,
+    localRunners: localRunnersFromStacks(target.id, managedStacks),
+    githubRunners: githubRunners.map((runner) => ({
+      id: runner.id,
+      name: runner.name,
+      status: runner.status,
+      busy: runner.busy,
+      labels: (runner.labels || []).map((label) => label.name),
+      os: runner.os,
+    })),
+    activeRun: activeRuns[0] || null,
+    activeRuns,
+    activeJobs,
+    latestRuns,
+    desiredRunnerCount,
+  };
+}
+
 async function killMatchingManagedRunner(runnerNames) {
   if (!runnerNames.length) {
     return [];
   }
 
-  const filters = encodeURIComponent(JSON.stringify({
-    label: [MANAGED_LABEL],
-  }));
-  const response = await docker(`/containers/json?all=1&filters=${filters}`);
-  if (response.statusCode < 200 || response.statusCode >= 300) {
-    throw new Error(`Docker API ${response.statusCode}`);
-  }
-
-  const targets = response.body.filter((container) => (
-    isManagedRunnerResource(container.Labels)
-    && runnerNames.includes(container.Labels?.[MANAGED_RUNNER_LABEL])
-  ));
+  const stacks = await listManagedStacks();
+  const targets = stacks.filter((stack) => runnerNames.includes(stack.runnerName));
   const results = [];
 
-  for (const container of targets) {
-    const killResponse = await docker(`/containers/${container.Id}/kill?signal=SIGKILL`, { method: 'POST' });
-    if (![204, 304, 409].includes(killResponse.statusCode)) {
-      throw new Error(`Runner kill failed with status ${killResponse.statusCode}`);
-    }
+  for (const stack of targets) {
+    await removeManagedStack(stack.stackId);
     results.push({
-      containerId: container.Id,
-      containerName: container.Names?.[0] || '',
-      statusCode: killResponse.statusCode,
+      containerId: stack.runnerContainer?.id || '',
+      containerName: stack.runnerContainer?.name || '',
+      stackId: stack.stackId,
+      statusCode: 204,
     });
   }
 
@@ -844,79 +987,116 @@ async function forceCancelRun(target, runId) {
     .filter(Boolean);
 
   const killedManaged = await killMatchingManagedRunner(runnerNames);
-  if (killedManaged.length) {
-    result.runnerKill = killedManaged;
-    return result;
-  }
-
-  const container = await getStaticRunnerContainer();
-  if (!container) {
+  if (!killedManaged.length) {
     result.runnerKill = [{ status: 'runner-not-found' }];
     return result;
   }
 
-  const killResponse = await docker(`/containers/${container.Id}/kill?signal=SIGKILL`, { method: 'POST' });
-  if (![204, 304, 409].includes(killResponse.statusCode)) {
-    throw new Error(`Runner kill failed with status ${killResponse.statusCode}`);
-  }
-
-  result.runnerKill = [{
-    containerId: container.Id,
-    containerName: container.Names?.[0] || '',
-    statusCode: killResponse.statusCode,
-  }];
+  result.runnerKill = killedManaged;
   return result;
 }
 
-async function getTargetStatus(target) {
-  const [githubRunners, latestRuns, localRunners] = await Promise.all([
-    githubRunnersForTarget(target),
-    latestRunsForTarget(target),
-    listManagedRunnerContainers(target.id, target),
-  ]);
+async function reconcileTarget(target) {
+  const managedStacksAll = await listManagedStacks();
+  const snapshot = await collectTargetSnapshot(target, managedStacksAll);
+  const staleStacks = snapshot.managedStacks.filter((stack) => shouldRemoveManagedStack(stack, snapshot));
+  const removedStackIds = new Set();
 
-  const activeRun = latestRuns.find((run) => run.status !== 'completed') || null;
-  const activeJobs = activeRun ? await listRunJobs(target, activeRun.id) : [];
+  for (const stack of staleStacks) {
+    await removeManagedStack(stack.stackId);
+    removedStackIds.add(stack.stackId);
+  }
+
+  let currentCount = snapshot.managedStacks.length - removedStackIds.size;
+  while (currentCount < snapshot.desiredRunnerCount) {
+    await launchRunner(target);
+    currentCount += 1;
+  }
+
+  if (currentCount > snapshot.desiredRunnerCount) {
+    const activeRunnerNames = new Set(snapshot.activeJobs.map((job) => job.runner_name).filter(Boolean));
+    const removableStacks = snapshot.managedStacks
+      .filter((stack) => !removedStackIds.has(stack.stackId))
+      .filter((stack) => !activeRunnerNames.has(stack.runnerName))
+      .sort((left, right) => (left.createdMs || 0) - (right.createdMs || 0));
+
+    for (const stack of removableStacks) {
+      if (currentCount <= snapshot.desiredRunnerCount) {
+        break;
+      }
+      if (Date.now() - (stack.createdMs || Date.now()) < DEFAULT_STACK_GRACE_MS) {
+        continue;
+      }
+      await removeManagedStack(stack.stackId);
+      currentCount -= 1;
+    }
+  }
+
+  return snapshot;
+}
+
+function createReconciler(targets) {
+  let timer = null;
+  let running = false;
+
+  async function reconcileOnce() {
+    if (running) {
+      return { skipped: true };
+    }
+
+    running = true;
+    try {
+      for (const target of targets) {
+        await reconcileTarget(target);
+      }
+      return { ok: true };
+    } finally {
+      running = false;
+    }
+  }
+
+  function start() {
+    if (timer) {
+      return timer;
+    }
+
+    timer = setInterval(() => {
+      reconcileOnce().catch((error) => {
+        console.error('[runner-status] reconcile failed', error);
+      });
+    }, DEFAULT_RECONCILE_INTERVAL_MS);
+    return timer;
+  }
+
+  function stop() {
+    if (!timer) {
+      return;
+    }
+    clearInterval(timer);
+    timer = null;
+  }
 
   return {
-    id: target.id,
-    name: target.name,
-    scope: target.scope,
-    owner: target.owner,
-    repo: target.repo,
-    repository: targetHasRepoFeed(target) ? `${target.owner}/${target.repo}` : target.owner,
-    description: target.description,
-    labels: target.labels,
-    localRunners,
-    githubRunners: githubRunners.map((runner) => ({
-      id: runner.id,
-      name: runner.name,
-      status: runner.status,
-      busy: runner.busy,
-      labels: (runner.labels || []).map((label) => label.name),
-      os: runner.os,
-    })),
-    activeRun,
-    activeJobs,
-    latestRuns,
+    reconcileOnce,
+    start,
+    stop,
   };
 }
 
-async function getStatus(targets) {
-  const targetStatuses = [];
-  for (const target of targets) {
-    targetStatuses.push(await getTargetStatus(target));
-  }
+async function getTargetStatus(target, allStacks = null) {
+  return collectTargetSnapshot(target, allStacks);
+}
 
-  const managedRunners = Array.from(new Map(
-    targetStatuses
-      .flatMap((target) => target.localRunners)
-      .map((runner) => [runner.id, runner]),
-  ).values());
+async function getStatus(targets) {
+  const allStacks = await listManagedStacks();
+  const targetStatuses = await Promise.all(targets.map((target) => getTargetStatus(target, allStacks)));
+  const managedRunners = localRunnersFromStacks('', allStacks);
+
   return {
     generatedAt: new Date().toISOString(),
     targets: targetStatuses,
     managedRunners,
+    managedStacks: allStacks,
   };
 }
 
@@ -933,15 +1113,12 @@ function renderTone(value, tone) {
 
 function renderManagedRunnerRows(target) {
   if (!target.localRunners.length) {
-    return '<tr><td colspan="5">No visible runner containers for this target.</td></tr>';
+    return '<tr><td colspan="5">No ephemeral runner stacks currently exist for this target.</td></tr>';
   }
 
-  return target.localRunners.map((runner) => {
-    const action = runner.persistent
-      ? '<span class="muted">Persistent</span>'
-      : `<button class="danger" data-container-id="${escapeHtml(runner.id)}" data-action="remove-runner">Remove</button>`;
-    return `<tr><td><code>${escapeHtml(runner.runnerName || runner.name)}</code></td><td>${escapeHtml(runner.state)}</td><td>${escapeHtml(runner.status)}</td><td>${escapeHtml(new Date(runner.created * 1000).toISOString())}</td><td>${action}</td></tr>`;
-  }).join('');
+  return target.localRunners.map((runner) => (
+    `<tr><td><code>${escapeHtml(runner.runnerName || runner.name)}</code></td><td>${escapeHtml(runner.state)}</td><td>${escapeHtml(runner.status)}</td><td>${escapeHtml(new Date((runner.createdMs || 0) || (runner.created * 1000)).toISOString())}</td><td><button class="danger" data-container-id="${escapeHtml(runner.id)}" data-action="remove-runner">Remove</button></td></tr>`
+  )).join('');
 }
 
 function renderGithubRunnerRows(target) {
@@ -987,9 +1164,9 @@ function renderActiveJobsRows(target) {
 
 function renderTargetCard(target) {
   const repositoryLabel = targetHasRepoFeed(target) ? target.repository : target.owner;
-  const activeRunCopy = target.activeRun
-    ? `Active run ${escapeHtml(target.activeRun.id)}`
-    : 'No active run';
+  const activeRunCopy = target.activeRuns.length
+    ? `${target.activeRuns.length} active run(s)`
+    : 'No active runs';
 
   return `
     <section class="card target-card">
@@ -1005,10 +1182,10 @@ function renderTargetCard(target) {
       </div>
       ${target.description ? `<p class="muted compact">${escapeHtml(target.description)}</p>` : ''}
       <div class="summary-strip">
-        <div><span class="summary-label">Managed</span><strong>${target.localRunners.length}</strong></div>
+        <div><span class="summary-label">Ephemeral</span><strong>${target.localRunners.length}</strong></div>
         <div><span class="summary-label">Registered</span><strong>${target.githubRunners.length}</strong></div>
         <div><span class="summary-label">Busy</span><strong>${target.githubRunners.filter((runner) => runner.busy).length}</strong></div>
-        <div><span class="summary-label">Latest</span><strong>${activeRunCopy}</strong></div>
+        <div><span class="summary-label">Demand</span><strong>${target.desiredRunnerCount}/${target.maxRunners}</strong></div>
       </div>
       <div class="meta-grid">
         <div>
@@ -1022,7 +1199,7 @@ function renderTargetCard(target) {
       </div>
       <div class="panel-grid">
         <section class="subcard">
-          <h3>Managed Containers</h3>
+          <h3>Ephemeral Runner Stacks</h3>
           <table>
             <thead><tr><th>Runner</th><th>State</th><th>Status</th><th>Created</th><th>Action</th></tr></thead>
             <tbody>${renderManagedRunnerRows(target)}</tbody>
@@ -1051,7 +1228,7 @@ function renderTargetCard(target) {
         <section class="subcard">
           <div class="section-head section-head-tight">
             <h3>Active Jobs</h3>
-            <span class="muted">${target.activeRun ? `run ${escapeHtml(target.activeRun.id)}` : 'idle'}</span>
+            <span class="muted">${activeRunCopy}</span>
           </div>
           <table>
             <thead><tr><th>Job</th><th>Status</th><th>Conclusion</th><th>Runner</th></tr></thead>
@@ -1066,7 +1243,7 @@ function renderTargetCard(target) {
 function render(status) {
   const managedCount = status.managedRunners.length;
   const registeredCount = status.targets.reduce((total, target) => total + target.githubRunners.length, 0);
-  const activeRuns = status.targets.filter((target) => target.activeRun).length;
+  const activeRuns = status.targets.reduce((total, target) => total + target.activeRuns.length, 0);
 
   return `<!doctype html>
 <html lang="en">
@@ -1143,24 +1320,24 @@ function render(status) {
     <section class="overview">
       <section class="card page-head">
         <h1>GitHub Runner Fleet</h1>
-        <p class="muted">Ephemeral runners by target, with GitHub registration state and repo-level run controls where that scope exists.</p>
+        <p class="muted">Ephemeral-only runner stacks by target, with isolated Docker daemons and repo-level run controls where that scope exists.</p>
         <p class="muted">Updated <code>${escapeHtml(status.generatedAt)}</code></p>
-        <p id="action-status" class="muted">Launch creates a fresh runner container for one target. Remove deletes that container and its work volume.</p>
+        <p id="action-status" class="muted">Launch creates a fresh runner stack for one target. Remove deletes the runner, dind, network, and volumes for that stack.</p>
       </section>
       <section class="metric"><span>Targets</span><strong>${status.targets.length}</strong></section>
-      <section class="metric"><span>Managed containers</span><strong>${managedCount}</strong></section>
+      <section class="metric"><span>Ephemeral runner stacks</span><strong>${managedCount}</strong></section>
       <section class="metric"><span>Registered runners</span><strong>${registeredCount}</strong></section>
     </section>
     <section class="card">
       <div class="section-head section-head-tight">
         <h2>Fleet state</h2>
-        <span class="muted">${activeRuns} target(s) with an active run</span>
+        <span class="muted">${activeRuns} active run(s) across the tracked repositories</span>
       </div>
       <table>
         <thead><tr><th>Container</th><th>Target</th><th>Runner</th><th>State</th><th>Status</th></tr></thead>
         <tbody>${status.managedRunners.length
           ? status.managedRunners.map((runner) => `<tr><td><code>${escapeHtml(runner.name)}</code></td><td>${escapeHtml(runner.targetId)}</td><td>${escapeHtml(runner.runnerName || '-')}</td><td>${escapeHtml(runner.state)}</td><td>${escapeHtml(runner.status)}</td></tr>`).join('')
-          : '<tr><td colspan="5">No managed runners currently exist.</td></tr>'}</tbody>
+          : '<tr><td colspan="5">No ephemeral runner stacks currently exist.</td></tr>'}</tbody>
       </table>
     </section>
     ${status.targets.map((target) => renderTargetCard(target)).join('')}
@@ -1195,13 +1372,13 @@ function render(status) {
     }
 
     async function removeRunner(containerId) {
-      const confirmed = window.confirm('Remove this managed runner container and its work volume?');
+      const confirmed = window.confirm('Remove this ephemeral runner stack and all of its Docker resources?');
       if (!confirmed) {
         return;
       }
 
       setBusy(true);
-      statusNode.textContent = 'Removing runner container ' + containerId.slice(0, 12) + '...';
+      statusNode.textContent = 'Removing runner stack ' + containerId.slice(0, 12) + '...';
       try {
         await callJson('/api/managed-runners/' + containerId + '/remove', { method: 'POST' });
         statusNode.textContent = 'Runner removed. Reloading...';
@@ -1244,7 +1421,7 @@ function render(status) {
     }
 
     async function forceCancel(targetId, runId) {
-      const confirmed = window.confirm('This sends GitHub cancel and kills the matching local runner container when possible. Continue?');
+      const confirmed = window.confirm('This sends GitHub cancel and removes the matching ephemeral runner stack when possible. Continue?');
       if (!confirmed) {
         return;
       }
@@ -1350,7 +1527,7 @@ function sendHtml(res, statusCode, html) {
   res.end(html);
 }
 
-function createServer(targets = loadTargets()) {
+function createServer(targets = loadTargets(), options = {}) {
   const targetMap = getTargetMap(targets);
 
   return http.createServer(async (req, res) => {
@@ -1372,12 +1549,14 @@ function createServer(targets = loadTargets()) {
           return;
         }
         const result = await launchRunner(target);
+        options.reconcileOnce?.().catch(() => {});
         sendJson(res, 200, result);
         return;
       }
 
       if (removeManagedMatch && req.method === 'POST') {
         const result = await removeManagedRunner(removeManagedMatch[1]);
+        options.reconcileOnce?.().catch(() => {});
         sendJson(res, 200, result);
         return;
       }
@@ -1400,6 +1579,7 @@ function createServer(targets = loadTargets()) {
           return;
         }
         const result = await forceCancelRun(target, forceCancelMatch[2]);
+        options.reconcileOnce?.().catch(() => {});
         sendJson(res, 200, result);
         return;
       }
@@ -1451,17 +1631,31 @@ function createServer(targets = loadTargets()) {
 }
 
 if (require.main === module) {
-  const server = createServer();
+  const targets = loadTargets();
+  const reconciler = createReconciler(targets);
+  reconciler.start();
+  reconciler.reconcileOnce().catch((error) => {
+    console.error('[runner-status] initial reconcile failed', error);
+  });
+
+  const server = createServer(targets, {
+    reconcileOnce: reconciler.reconcileOnce,
+  });
   server.listen(parseListenPort(process.env.STATUS_PORT), '0.0.0.0');
 }
 
 module.exports = {
   buildRunnerContainerSpec,
   createServer,
+  createReconciler,
+  desiredRunnerCountForTarget,
+  groupManagedStacks,
   loadTargets,
   normalizeTarget,
   parseListenPort,
   parseRepoUrl,
   parseTargetsJson,
+  shouldRemoveManagedStack,
   slugify,
+  targetHasRepoFeed,
 };

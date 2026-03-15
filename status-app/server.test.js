@@ -3,9 +3,12 @@ const assert = require('node:assert/strict');
 
 const {
   buildRunnerContainerSpec,
+  desiredRunnerCountForTarget,
+  groupManagedStacks,
   loadTargets,
   parseListenPort,
   parseRepoUrl,
+  shouldRemoveManagedStack,
 } = require('./server');
 
 test('parseRepoUrl extracts owner and repo', () => {
@@ -20,6 +23,7 @@ test('loadTargets supports repo and org targets with default token fallback', ()
     ACCESS_TOKEN: 'top-secret',
     RUNNER_IMAGE: 'myoung34/github-runner:latest',
     RUNNER_WORKDIR: '/tmp/github-runner',
+    MAX_RUNNERS_PER_TARGET: '3',
     LABELS: 'self-hosted,linux',
     RUNNER_TARGETS_JSON: JSON.stringify([
       {
@@ -40,6 +44,7 @@ test('loadTargets supports repo and org targets with default token fallback', ()
 
   assert.equal(targets.length, 2);
   assert.equal(targets[0].repoUrl, 'https://github.com/bpf-project/bpf-application');
+  assert.equal(targets[0].maxRunners, 3);
   assert.equal(targets[1].scope, 'org');
   assert.equal(targets[1].repo, 'gymnerd-bot');
   assert.equal(targets[1].repoUrl, 'https://github.com/gymnerd-ar/gymnerd-bot');
@@ -84,6 +89,111 @@ test('buildRunnerContainerSpec creates isolated ephemeral runner payload', () =>
   ]);
   assert.ok(spec.dindBody.HostConfig.Binds.some((entry) => entry.endsWith(':/var/lib/docker')));
   assert.equal(spec.dindBody.Labels['io.github-runner-fleet.role'], 'dind');
+});
+
+test('desired runner count follows queued work and target cap', () => {
+  const count = desiredRunnerCountForTarget({
+    target: { maxRunners: 2 },
+    activeRuns: [{ id: 1 }],
+    activeJobs: [
+      { status: 'queued', runner_name: '' },
+      { status: 'queued', runner_name: null },
+      { status: 'in_progress', runner_name: 'runner-a' },
+    ],
+    managedStacks: [{ runnerName: 'runner-a' }],
+  });
+
+  assert.equal(count, 2);
+});
+
+test('groupManagedStacks merges runner, dind, volume, and network resources', () => {
+  const stacks = groupManagedStacks(
+    [
+      {
+        id: 'runner-1',
+        shortId: 'runner-1',
+        name: 'runner-stack-old',
+        state: 'running',
+        status: 'Up',
+        createdMs: 1,
+        targetId: 'gymnerd-org',
+        runnerName: 'gymnerd-runner-1',
+        role: 'runner',
+        stackId: 'stack-old',
+      },
+      {
+        id: 'dind-1',
+        shortId: 'dind-1',
+        name: 'docker-stack-old',
+        state: 'running',
+        status: 'Up',
+        createdMs: 1,
+        targetId: 'gymnerd-org',
+        runnerName: 'gymnerd-runner-1',
+        role: 'dind',
+        stackId: 'stack-old',
+      },
+    ],
+    [
+      {
+        Name: 'volume-old',
+        createdMs: 2,
+        targetId: 'gymnerd-org',
+        runnerName: 'gymnerd-runner-1',
+        stackId: 'stack-old',
+      },
+    ],
+    [
+      {
+        Name: 'network-old',
+        createdMs: 3,
+        targetId: 'gymnerd-org',
+        runnerName: 'gymnerd-runner-1',
+        stackId: 'stack-old',
+      },
+    ],
+  );
+
+  assert.equal(stacks.length, 1);
+  assert.equal(stacks[0].runnerContainer.id, 'runner-1');
+  assert.equal(stacks[0].dindContainer.id, 'dind-1');
+  assert.deepEqual(stacks[0].volumes.map((volume) => volume.Name), ['volume-old']);
+  assert.deepEqual(stacks[0].networks.map((network) => network.Name), ['network-old']);
+});
+
+test('shouldRemoveManagedStack removes dead or idle stacks but preserves active ones', () => {
+  const snapshot = {
+    activeRuns: [{ id: 1 }],
+    activeJobs: [{ runner_name: 'runner-active' }],
+    managedStacks: [],
+    desiredRunnerCount: 1,
+  };
+
+  const activeStack = {
+    stackId: 'stack-active',
+    runnerName: 'runner-active',
+    createdMs: Date.now() - 60_000,
+    runnerContainer: { state: 'running' },
+    dindContainer: { state: 'running' },
+  };
+  const deadStack = {
+    stackId: 'stack-dead',
+    runnerName: 'runner-dead',
+    createdMs: Date.now() - 60_000,
+    runnerContainer: { state: 'exited' },
+    dindContainer: { state: 'running' },
+  };
+  const idleSnapshot = {
+    ...snapshot,
+    activeRuns: [],
+    activeJobs: [],
+    managedStacks: [activeStack],
+    desiredRunnerCount: 0,
+  };
+
+  assert.equal(shouldRemoveManagedStack(activeStack, snapshot), false);
+  assert.equal(shouldRemoveManagedStack(deadStack, snapshot), true);
+  assert.equal(shouldRemoveManagedStack(activeStack, idleSnapshot), true);
 });
 
 test('parseListenPort ignores host bind strings and keeps internal default', () => {

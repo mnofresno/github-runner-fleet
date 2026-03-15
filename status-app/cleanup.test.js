@@ -2,12 +2,12 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { buildCleanupPlan, shouldRunCleanup } = require('./cleanup');
 
-test('cleanup runs when runner is idle', () => {
+test('cleanup runs when runner fleet is idle', () => {
   const result = shouldRunCleanup({
     status: {
       targets: [{
         githubRunners: [{ busy: false }],
-        activeRun: null,
+        activeRuns: [],
         activeJobs: [],
       }],
     },
@@ -22,13 +22,13 @@ test('cleanup runs when runner is idle', () => {
   assert.equal(result.reason, 'runner-idle');
 });
 
-test('cleanup skips while runner is busy', () => {
+test('cleanup skips while a run is active', () => {
   const result = shouldRunCleanup({
     status: {
       targets: [{
         githubRunners: [{ busy: true }],
-        activeRun: { id: 1 },
-        activeJobs: [{ name: 'build' }],
+        activeRuns: [{ id: 1 }],
+        activeJobs: [{ name: 'build', runner_name: 'busy-runner' }],
       }],
     },
     cleanupState: {
@@ -42,51 +42,80 @@ test('cleanup skips while runner is busy', () => {
   assert.equal(result.reason, 'run-active');
 });
 
-test('cleanup plan collects stale exited runners and orphan compose projects', () => {
+test('cleanup plan collects stale managed stacks with no running containers', () => {
   const plan = buildCleanupPlan({
     status: {
       targets: [{
         githubRunners: [{ name: 'busy-runner', busy: true }],
         localRunners: [{ runnerName: 'busy-runner', state: 'running' }],
-        activeRun: null,
+        activeRuns: [],
         activeJobs: [],
       }],
     },
     dockerContainers: [
       {
-        Id: 'managed-exited',
+        Id: 'managed-runner',
         Created: Math.floor((Date.now() - (45 * 60 * 1000)) / 1000),
         State: 'exited',
         Labels: {
           'io.github-runner-fleet.managed': 'true',
+          'io.github-runner-fleet.stack-id': 'stack-old',
           'io.github-runner-fleet.runner-name': 'old-runner',
+          'io.github-runner-fleet.target-id': 'gymnerd-org',
         },
       },
       {
-        Id: 'compose-nginx',
+        Id: 'managed-dind',
         Created: Math.floor((Date.now() - (45 * 60 * 1000)) / 1000),
-        State: 'running',
+        State: 'exited',
         Labels: {
-          'com.docker.compose.project': 'orphan-runner-123',
-          'com.docker.compose.project.working_dir': '/tmp/github-runner/orphan-runner-123/repo',
-          'com.docker.compose.network': 'orphan-runner-123_default',
+          'io.github-runner-fleet.managed': 'true',
+          'io.github-runner-fleet.stack-id': 'stack-old',
+          'io.github-runner-fleet.runner-name': 'old-runner',
+          'io.github-runner-fleet.target-id': 'gymnerd-org',
         },
       },
       {
-        Id: 'compose-ignored',
+        Id: 'managed-busy',
         Created: Math.floor((Date.now() - (45 * 60 * 1000)) / 1000),
         State: 'running',
         Labels: {
-          'com.docker.compose.project': 'busy-runner',
-          'com.docker.compose.project.working_dir': '/tmp/github-runner/busy-runner/repo',
+          'io.github-runner-fleet.managed': 'true',
+          'io.github-runner-fleet.stack-id': 'stack-busy',
+          'io.github-runner-fleet.runner-name': 'busy-runner',
+          'io.github-runner-fleet.target-id': 'gymnerd-org',
+        },
+      },
+    ],
+    dockerVolumes: [
+      {
+        Name: 'volume-old',
+        CreatedAt: new Date(Date.now() - (45 * 60 * 1000)).toISOString(),
+        Labels: {
+          'io.github-runner-fleet.managed': 'true',
+          'io.github-runner-fleet.stack-id': 'stack-old',
+          'io.github-runner-fleet.runner-name': 'old-runner',
+          'io.github-runner-fleet.target-id': 'gymnerd-org',
+        },
+      },
+    ],
+    dockerNetworks: [
+      {
+        Name: 'network-old',
+        Created: new Date(Date.now() - (45 * 60 * 1000)).toISOString(),
+        Labels: {
+          'io.github-runner-fleet.managed': 'true',
+          'io.github-runner-fleet.stack-id': 'stack-old',
+          'io.github-runner-fleet.runner-name': 'old-runner',
+          'io.github-runner-fleet.target-id': 'gymnerd-org',
         },
       },
     ],
   });
 
-  assert.deepEqual(plan.staleManagedRunnerIds, ['managed-exited']);
-  assert.equal(plan.staleComposeProjects.length, 1);
-  assert.equal(plan.staleComposeProjects[0].project, 'orphan-runner-123');
-  assert.equal(plan.staleComposeProjects[0].workdir, '/tmp/github-runner/orphan-runner-123');
-  assert.deepEqual(plan.staleComposeProjects[0].containerIds, ['compose-nginx']);
+  assert.equal(plan.staleManagedStacks.length, 1);
+  assert.deepEqual(plan.staleManagedStacks[0].containerIds, ['managed-runner', 'managed-dind']);
+  assert.deepEqual(plan.staleManagedStacks[0].volumeNames, ['volume-old']);
+  assert.deepEqual(plan.staleManagedStacks[0].networkNames, ['network-old']);
+  assert.equal(plan.staleManagedStacks[0].runnerName, 'old-runner');
 });
