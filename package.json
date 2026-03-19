@@ -6,7 +6,7 @@
     "build:client": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
     "start": "node dist-server/status-app/server.js",
-    "test": "c8 --check-coverage --lines 85 --functions 85 --branches 85 --statements 85 --include=status-app/*.ts --exclude=status-app/*.test.ts --exclude=status-app/cleanup.ts tsx --test status-app/**/*.test.ts",
+    "test": "c8 --check-coverage --lines 85 --functions 85 --branches 85 --statements 85 --include=status-app/*.ts --exclude=status-app/*.test.ts --exclude=status-app/cleanup.ts tsx --test status-app/*.test.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.server.json"
   },
   "dependencies": {
