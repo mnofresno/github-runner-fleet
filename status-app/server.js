@@ -2,6 +2,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { URL } = require('url');
 
 const DEFAULT_PORT = 8080;
@@ -12,6 +13,8 @@ const DEFAULT_RUNNER_IMAGE = process.env.RUNNER_IMAGE || 'myoung34/github-runner
 const HEALTHCHECK_INTERVAL_MS = Number.parseInt(process.env.HEALTHCHECK_INTERVAL_MS || '15000', 10);
 const DATA_DIR = process.env.DATA_DIR || '/app/data';
 const TARGETS_FILE = path.join(DATA_DIR, 'targets.json');
+const AUTOCOMPLETE_CACHE_TTL_MS = Number.parseInt(process.env.AUTOCOMPLETE_CACHE_TTL_MS || '60000', 10);
+const AUTOCOMPLETE_CACHE_MAX_ENTRIES = Math.max(20, Number.parseInt(process.env.AUTOCOMPLETE_CACHE_MAX_ENTRIES || '200', 10));
 
 const MANAGED_LABEL = 'io.github-runner-fleet.managed';
 const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
@@ -87,6 +90,51 @@ function parseListenPort(value) {
 }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+/* ── Small In-Memory Cache ─────────────────────────────────────────── */
+
+const autocompleteCache = new Map();
+
+function hashToken(value) {
+  return crypto.createHash('sha1').update(String(value || '')).digest('hex');
+}
+
+function buildAutocompleteCacheKey(scope, token, parts = []) {
+  return [scope, hashToken(token), ...parts.map((part) => String(part || '').trim().toLowerCase())].join('::');
+}
+
+function readAutocompleteCache(key, now = Date.now()) {
+  const entry = autocompleteCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= now) {
+    autocompleteCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function writeAutocompleteCache(key, value, ttlMs = AUTOCOMPLETE_CACHE_TTL_MS, now = Date.now()) {
+  if (autocompleteCache.size >= AUTOCOMPLETE_CACHE_MAX_ENTRIES) {
+    const oldestKey = autocompleteCache.keys().next().value;
+    if (oldestKey) autocompleteCache.delete(oldestKey);
+  }
+  autocompleteCache.set(key, {
+    value,
+    expiresAt: now + Math.max(1000, ttlMs),
+  });
+  return value;
+}
+
+function clearAutocompleteCache() {
+  autocompleteCache.clear();
+}
+
+async function withAutocompleteCache(key, loader, ttlMs = AUTOCOMPLETE_CACHE_TTL_MS, now = Date.now()) {
+  const cached = readAutocompleteCache(key, now);
+  if (cached) return cached;
+  const value = await loader();
+  return writeAutocompleteCache(key, value, ttlMs, now);
+}
 
 /* ── GitHub API ─────────────────────────────────────────────────────── */
 
@@ -356,21 +404,24 @@ function validateTargetFormInput(input) {
 async function githubOwnerSuggestions(token, q = '') {
   const query = String(q || '').trim();
   if (!token) throw new Error('Missing ACCESS_TOKEN for owner lookup');
+  const cacheKey = buildAutocompleteCacheKey('owners', token, [query]);
 
-  if (query) {
-    const payload = await github(token, `/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`);
-    return normalizeAutocompleteItems((payload.items || []).map((item) => item.login), query);
-  }
+  return withAutocompleteCache(cacheKey, async () => {
+    if (query) {
+      const payload = await github(token, `/search/users?q=${encodeURIComponent(`${query} in:login`)}&per_page=20`);
+      return normalizeAutocompleteItems((payload.items || []).map((item) => item.login), query);
+    }
 
-  const [user, orgs] = await Promise.all([
-    github(token, '/user'),
-    github(token, '/user/orgs?per_page=100'),
-  ]);
+    const [user, orgs] = await Promise.all([
+      github(token, '/user'),
+      github(token, '/user/orgs?per_page=100'),
+    ]);
 
-  return normalizeAutocompleteItems([
-    user?.login,
-    ...(Array.isArray(orgs) ? orgs.map((org) => org.login) : []),
-  ]);
+    return normalizeAutocompleteItems([
+      user?.login,
+      ...(Array.isArray(orgs) ? orgs.map((org) => org.login) : []),
+    ]);
+  });
 }
 
 async function githubRepoSuggestions(token, owner, q = '') {
@@ -378,21 +429,24 @@ async function githubRepoSuggestions(token, owner, q = '') {
   const ownerName = String(owner || '').trim();
   if (!token) throw new Error('Missing ACCESS_TOKEN for repo lookup');
   if (!ownerName) throw new Error('Owner / Org is required for repo lookup');
+  const cacheKey = buildAutocompleteCacheKey('repos', token, [ownerName, query]);
 
-  if (query) {
-    const payload = await github(token, `/search/repositories?q=${encodeURIComponent(`${query} user:${ownerName}`)}&per_page=50`);
-    return normalizeAutocompleteItems((payload.items || []).map((item) => item.name), query);
-  }
+  return withAutocompleteCache(cacheKey, async () => {
+    if (query) {
+      const payload = await github(token, `/search/repositories?q=${encodeURIComponent(`${query} user:${ownerName}`)}&per_page=50`);
+      return normalizeAutocompleteItems((payload.items || []).map((item) => item.name), query);
+    }
 
-  try {
-    const orgRepos = await github(token, `/orgs/${encodeURIComponent(ownerName)}/repos?per_page=100`);
-    return normalizeAutocompleteItems((Array.isArray(orgRepos) ? orgRepos : []).map((repo) => repo.name));
-  } catch (error) {
-    if (!error.message.includes('404')) throw error;
-  }
+    try {
+      const orgRepos = await github(token, `/orgs/${encodeURIComponent(ownerName)}/repos?per_page=100`);
+      return normalizeAutocompleteItems((Array.isArray(orgRepos) ? orgRepos : []).map((repo) => repo.name));
+    } catch (error) {
+      if (!error.message.includes('404')) throw error;
+    }
 
-  const userRepos = await github(token, `/users/${encodeURIComponent(ownerName)}/repos?per_page=100`);
-  return normalizeAutocompleteItems((Array.isArray(userRepos) ? userRepos : []).map((repo) => repo.name));
+    const userRepos = await github(token, `/users/${encodeURIComponent(ownerName)}/repos?per_page=100`);
+    return normalizeAutocompleteItems((Array.isArray(userRepos) ? userRepos : []).map((repo) => repo.name));
+  });
 }
 
 /* ── Persistent Runner Management ────────────────────────────────────── */
@@ -1338,5 +1392,7 @@ if (require.main === module) {
 module.exports = {
   createServer, loadTargets, normalizeTarget, parseLabels, parseListenPort,
   slugify, targetHasRepoFeed, normalizeAutocompleteItems, resolveAutocompleteToken,
-  validateTargetFormInput, loadPersistedTargets, saveTargets, ensureRunnersForTarget,
+  validateTargetFormInput, buildAutocompleteCacheKey, readAutocompleteCache,
+  writeAutocompleteCache, withAutocompleteCache, clearAutocompleteCache,
+  loadPersistedTargets, saveTargets, ensureRunnersForTarget,
 };

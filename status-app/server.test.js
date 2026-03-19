@@ -10,6 +10,11 @@ const {
   normalizeAutocompleteItems,
   resolveAutocompleteToken,
   validateTargetFormInput,
+  buildAutocompleteCacheKey,
+  readAutocompleteCache,
+  writeAutocompleteCache,
+  withAutocompleteCache,
+  clearAutocompleteCache,
   loadPersistedTargets,
   saveTargets,
 } = require('./server');
@@ -133,6 +138,37 @@ test('resolveAutocompleteToken prefers target token when targetId is provided', 
 test('resolveAutocompleteToken falls back to env ACCESS_TOKEN', () => {
   const token = resolveAutocompleteToken([{ id: 'one', accessToken: 'tok_one' }], '', { ACCESS_TOKEN: 'env_tok' });
   assert.equal(token, 'env_tok');
+});
+
+/* ── Autocomplete cache ──────────────────────────────────────────── */
+
+test('buildAutocompleteCacheKey hashes token and normalizes parts', () => {
+  const key = buildAutocompleteCacheKey('owners', 'secret-token', [' GymNerd-Ar ', '']);
+  assert.match(key, /^owners::[a-f0-9]{40}::gymnerd-ar::$/);
+  assert.ok(!key.includes('secret-token'));
+});
+
+test('writeAutocompleteCache and readAutocompleteCache roundtrip until ttl expires', () => {
+  clearAutocompleteCache();
+  writeAutocompleteCache('owners::x', ['gymnerd-ar'], 1200, 1000);
+  assert.deepEqual(readAutocompleteCache('owners::x', 1001), ['gymnerd-ar']);
+  assert.equal(readAutocompleteCache('owners::x', 2205), null);
+});
+
+test('withAutocompleteCache only invokes loader once before ttl expiry', async () => {
+  clearAutocompleteCache();
+  let calls = 0;
+  const loader = async () => {
+    calls += 1;
+    return ['gymnerd-ar'];
+  };
+
+  const first = await withAutocompleteCache('owners::y', loader, 100, 1000);
+  const second = await withAutocompleteCache('owners::y', loader, 100, 1001);
+
+  assert.deepEqual(first, ['gymnerd-ar']);
+  assert.deepEqual(second, ['gymnerd-ar']);
+  assert.equal(calls, 1);
 });
 
 /* ── Form validation ─────────────────────────────────────────────── */
