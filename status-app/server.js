@@ -21,6 +21,7 @@ const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
 const MANAGED_RUNNER_LABEL = 'io.github-runner-fleet.runner-name';
 const MANAGED_ROLE_LABEL = 'io.github-runner-fleet.role';
 const MANAGED_STACK_LABEL = 'io.github-runner-fleet.stack-id';
+const CLIENT_DIST_DIR = path.join(__dirname, '..', 'frontend', 'dist');
 
 /* ── Utilities ──────────────────────────────────────────────────────── */
 
@@ -1225,6 +1226,50 @@ function sendHtml(res, code, html) {
   res.end(html);
 }
 
+function mimeTypeFor(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  return {
+    '.css': 'text/css; charset=utf-8',
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml',
+  }[extension] || 'application/octet-stream';
+}
+
+function safeClientPathname(urlPathname) {
+  const normalized = path.normalize(urlPathname).replace(/^(\.\.(\/|\\|$))+/, '');
+  return normalized === path.sep ? '' : normalized.replace(/^[/\\]+/, '');
+}
+
+function sendFile(res, filePath) {
+  const body = fs.readFileSync(filePath);
+  res.writeHead(200, {
+    'Content-Type': mimeTypeFor(filePath),
+    'Cache-Control': filePath.endsWith('index.html') ? 'no-store' : 'public, max-age=31536000, immutable',
+  });
+  res.end(body);
+}
+
+function sendClientApp(res) {
+  sendFile(res, path.join(CLIENT_DIST_DIR, 'index.html'));
+}
+
+function trySendClientAsset(res, urlPathname) {
+  const assetPath = path.join(CLIENT_DIST_DIR, safeClientPathname(urlPathname));
+  if (!assetPath.startsWith(CLIENT_DIST_DIR)) {
+    sendJson(res, 404, { error: 'Not found' });
+    return true;
+  }
+
+  if (fs.existsSync(assetPath) && fs.statSync(assetPath).isFile()) {
+    sendFile(res, assetPath);
+    return true;
+  }
+
+  return false;
+}
+
 function createServer(initialTargets, _options = {}) {
   let targets = [...initialTargets];
 
@@ -1345,8 +1390,16 @@ function createServer(initialTargets, _options = {}) {
         return;
       }
 
-      const status = await getStatus(targets);
-      sendHtml(res, 200, render(status));
+      if (url.pathname.startsWith('/api/')) {
+        sendJson(res, 404, { error: 'Not found' });
+        return;
+      }
+
+      if (url.pathname !== '/' && trySendClientAsset(res, url.pathname)) {
+        return;
+      }
+
+      sendClientApp(res);
     } catch (error) {
       sendJson(res, 500, { error: error.message });
     }

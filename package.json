@@ -2,6 +2,20 @@
   "name": "github-runner-fleet",
   "private": true,
   "scripts": {
-    "test": "node --test"
+    "build": "vite build",
+    "start": "node status-app/server.js",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3"
   }
 }
