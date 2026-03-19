@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildCleanupPlan, shouldRunCleanup } = require('./cleanup');
+const { buildCleanupPlan, shouldRunCleanup } = require('./cleanup.ts');
 
 test('cleanup runs when runner fleet is idle', () => {
   const result = shouldRunCleanup({

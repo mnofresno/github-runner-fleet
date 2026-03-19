@@ -17,7 +17,7 @@ const {
   clearAutocompleteCache,
   loadPersistedTargets,
   saveTargets,
-} = require('./server');
+} = require('./server.ts');
 
 const fs = require('fs');
 const path = require('path');
