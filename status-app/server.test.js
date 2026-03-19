@@ -5,6 +5,10 @@ const {
   buildRunnerContainerSpec,
   desiredRunnerCountForTarget,
   groupManagedStacks,
+  githubCacheGet,
+  githubCacheKey,
+  githubCacheSet,
+  filterAutocompleteValues,
   loadTargets,
   parseListenPort,
   parseRepoUrl,
@@ -194,6 +198,23 @@ test('shouldRemoveManagedStack removes dead or idle stacks but preserves active 
   assert.equal(shouldRemoveManagedStack(activeStack, snapshot), false);
   assert.equal(shouldRemoveManagedStack(deadStack, snapshot), true);
   assert.equal(shouldRemoveManagedStack(activeStack, idleSnapshot), true);
+});
+
+test('github API cache key / get / set works', () => {
+  const key = githubCacheKey('abc', '/foo');
+  assert.equal(key, 'abc:/foo');
+  assert.equal(githubCacheGet('abc', '/foo'), null);
+
+  githubCacheSet('abc', '/foo', { value: 123 });
+  const cached = githubCacheGet('abc', '/foo');
+  assert.deepEqual(cached, { value: 123 });
+});
+
+test('filterAutocompleteValues deduplicates, sorts and filters locally', () => {
+  assert.deepEqual(
+    filterAutocompleteValues(['gymnerd-ar', 'GymNerd-Ar', 'bpf-project', 'mnofresno'], 'g'),
+    ['gymnerd-ar'],
+  );
 });
 
 test('parseListenPort ignores host bind strings and keeps internal default', () => {

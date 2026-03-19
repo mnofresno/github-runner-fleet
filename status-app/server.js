@@ -8,6 +8,93 @@ const DEFAULT_DIND_IMAGE = 'docker:27-dind';
 const DEFAULT_RECONCILE_INTERVAL_MS = Number.parseInt(process.env.RECONCILE_INTERVAL_MS || '5000', 10);
 const DEFAULT_STACK_GRACE_MS = Number.parseInt(process.env.STACK_GRACE_MS || '30000', 10);
 const DEFAULT_MAX_RUNNERS_PER_TARGET = Math.max(1, Number.parseInt(process.env.MAX_RUNNERS_PER_TARGET || '2', 10));
+const GITHUB_API_CACHE_MS = Math.max(0, Number.parseInt(process.env.GITHUB_API_CACHE_MS || '300000', 10));
+const githubApiCache = new Map();
+
+function githubCacheKey(token, path) {
+  return `${token}:${path}`;
+}
+
+function githubCacheGet(token, path) {
+  const entry = githubApiCache.get(githubCacheKey(token, path));
+  if (entry && entry.expires > Date.now()) {
+    return entry.value;
+  }
+  githubApiCache.delete(githubCacheKey(token, path));
+  return null;
+}
+
+function githubCacheSet(token, path, value) {
+  githubApiCache.set(githubCacheKey(token, path), {
+    expires: Date.now() + GITHUB_API_CACHE_MS,
+    value,
+  });
+}
+
+async function githubCached(token, path) {
+  const cached = githubCacheGet(token, path);
+  if (cached) {
+    return cached;
+  }
+  const value = await github(token, path);
+  githubCacheSet(token, path, value);
+  return value;
+}
+
+function filterAutocompleteValues(items, query = '') {
+  const needle = String(query || '').trim().toLowerCase();
+  const seen = new Set();
+  return (Array.isArray(items) ? items : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .filter((item) => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return !needle || key.includes(needle);
+    })
+    .sort((left, right) => left.localeCompare(right));
+}
+
+async function githubOwnerSuggestions(token, query = '') {
+  const [user, orgs] = await Promise.all([
+    githubCached(token, '/user'),
+    githubCached(token, '/user/orgs?per_page=100'),
+  ]);
+  const owners = [
+    user?.login,
+    ...(Array.isArray(orgs) ? orgs.map((org) => org.login) : []),
+  ];
+  return filterAutocompleteValues(owners, query);
+}
+
+async function githubRepoSuggestions(token, owner, query = '') {
+  const ownerName = String(owner || '').trim();
+  if (!ownerName) {
+    return [];
+  }
+
+  const accessibleOwners = await githubOwnerSuggestions(token);
+  const allowedOwners = new Set(accessibleOwners.map((item) => item.toLowerCase()));
+  if (!allowedOwners.has(ownerName.toLowerCase())) {
+    return [];
+  }
+
+  const currentUser = await githubCached(token, '/user');
+  let repos = [];
+  if (String(currentUser?.login || '').toLowerCase() === ownerName.toLowerCase()) {
+    const userRepos = await githubCached(token, '/user/repos?per_page=100&affiliation=owner');
+    repos = (Array.isArray(userRepos) ? userRepos : []).map((repo) => repo.name);
+  } else {
+    const orgRepos = await githubCached(token, `/orgs/${encodeURIComponent(ownerName)}/repos?per_page=100&type=all`);
+    repos = (Array.isArray(orgRepos) ? orgRepos : []).map((repo) => repo.name);
+  }
+
+  return filterAutocompleteValues(repos, query);
+}
+
 const MANAGED_LABEL = 'io.github-runner-fleet.managed';
 const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
 const MANAGED_RUNNER_LABEL = 'io.github-runner-fleet.runner-name';
@@ -1330,6 +1417,35 @@ function render(status) {
     </section>
     <section class="card">
       <div class="section-head section-head-tight">
+        <h2>Target navigation helper</h2>
+      </div>
+      <div class="meta-grid">
+        <label>
+          <span class="meta-label">Target (token provider)</span>
+          <select id="github-target" style="width:100%;" aria-label="Github target selector">
+            ${status.targets.map((target) => `<option value="${escapeHtml(target.id)}">${escapeHtml(target.name)} (${escapeHtml(target.id)})</option>`).join('')}
+          </select>
+        </label>
+        <label>
+          <span class="meta-label">Owner / Org</span>
+          <input id="github-owner" list="owner-options" type="search" placeholder="Start typing owner/org" autocomplete="off" style="width:100%;" />
+          <datalist id="owner-options"></datalist>
+        </label>
+        <label>
+          <span class="meta-label">Repo</span>
+          <input id="github-repo" list="repo-options" type="search" placeholder="Start typing repo" autocomplete="off" style="width:100%;" disabled />
+          <datalist id="repo-options"></datalist>
+        </label>
+      </div>
+      <div class="toolbar" style="margin-top:8px;">
+        <button id="github-refresh-owners">Refresh owners</button>
+        <button id="github-refresh-repos" disabled>Refresh repos</button>
+        <button id="github-copy-snippet">Copy RUNNER_TARGETS_JSON snippet</button>
+      </div>
+      <div id="github-helper-status" class="muted">Use this panel to find owner/org + repo names with GitHub-backed autocomplete and get copy/paste target JSON.</div>
+    </section>
+    <section class="card">
+      <div class="section-head section-head-tight">
         <h2>Fleet state</h2>
         <span class="muted">${activeRuns} active run(s) across the tracked repositories</span>
       </div>
@@ -1357,6 +1473,110 @@ function render(status) {
       }
       return payload;
     }
+
+    async function githubFetchOwners(targetId, q = '') {
+      const queryString = '?targetId=' + encodeURIComponent(targetId) + (q ? '&q=' + encodeURIComponent(q) : '');
+      return callJson('/api/github/owners' + queryString);
+    }
+
+    async function githubFetchRepos(targetId, owner, q = '') {
+      const params = new URLSearchParams({ targetId, owner });
+      if (q) params.set('q', q);
+      return callJson('/api/github/repos?' + params.toString());
+    }
+
+    function setGithubHelperStatus(message, isError = false) {
+      const node = document.getElementById('github-helper-status');
+      node.textContent = message;
+      node.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+    }
+
+    async function refreshOwnerOptions() {
+      const targetId = document.getElementById('github-target').value;
+      setGithubHelperStatus('Loading owner/org list...');
+      try {
+        const owners = await githubFetchOwners(targetId);
+        const ownerDataList = document.getElementById('owner-options');
+        ownerDataList.innerHTML = owners.map(function(owner) {
+          return '<option value="' + owner + '"></option>';
+        }).join('');
+        setGithubHelperStatus('Loaded ' + owners.length + ' owner(s).');
+      } catch (error) {
+        setGithubHelperStatus('Owner lookup failed: ' + error.message, true);
+      }
+    }
+
+    async function refreshRepoOptions() {
+      const targetId = document.getElementById('github-target').value;
+      const owner = document.getElementById('github-owner').value.trim();
+      if (!owner) {
+        setGithubHelperStatus('Select owner/org first.');
+        return;
+      }
+      setGithubHelperStatus('Loading repos for ' + owner + '...');
+      try {
+        const repos = await githubFetchRepos(targetId, owner);
+        const repoDataList = document.getElementById('repo-options');
+        repoDataList.innerHTML = repos.map(function(repo) { return '<option value="' + repo + '"></option>'; }).join('');
+        document.getElementById('github-repo').disabled = false;
+        setGithubHelperStatus('Loaded ' + repos.length + ' repos for ' + owner + '.');
+      } catch (error) {
+        setGithubHelperStatus('Repo lookup failed: ' + error.message, true);
+      }
+    }
+
+    function createRunnerTargetSnippet() {
+      const targetId = document.getElementById('github-target').value;
+      const owner = document.getElementById('github-owner').value.trim();
+      const repo = document.getElementById('github-repo').value.trim();
+      if (!owner) {
+        setGithubHelperStatus('Owner is required to build snippet.', true);
+        return;
+      }
+      const fragment = {
+        id: owner + '-' + (repo || 'org') + '-target',
+        name: owner + (repo ? '/' + repo : ''),
+        scope: repo ? 'repo' : 'org',
+        owner,
+        repo: repo || undefined,
+        accessToken: '<your token or set via env>',
+      };
+      const snippet = JSON.stringify([fragment], null, 2);
+      navigator.clipboard.writeText(snippet).then(() => {
+        setGithubHelperStatus('Snippet copied to clipboard! Paste into RUNNER_TARGETS_JSON.');
+      }, (err) => {
+        setGithubHelperStatus('Could not copy snippet: ' + err, true);
+      });
+    }
+
+    document.getElementById('github-target').addEventListener('change', () => {
+      refreshOwnerOptions();
+    });
+
+    document.getElementById('github-refresh-owners').addEventListener('click', () => {
+      refreshOwnerOptions();
+    });
+
+    document.getElementById('github-refresh-repos').addEventListener('click', () => {
+      refreshRepoOptions();
+    });
+
+    document.getElementById('github-copy-snippet').addEventListener('click', () => {
+      createRunnerTargetSnippet();
+    });
+
+    document.getElementById('github-owner').addEventListener('input', () => {
+      const owner = document.getElementById('github-owner').value.trim();
+      document.getElementById('github-refresh-repos').disabled = owner === '';
+    });
+
+    document.getElementById('github-repo').addEventListener('input', () => {
+      const owner = document.getElementById('github-owner').value.trim();
+      const repo = document.getElementById('github-repo').value;
+      setGithubHelperStatus(owner ? 'Selecting ' + owner + '/' + repo : 'Select owner/org first.');
+    });
+
+    refreshOwnerOptions().catch(() => {});
 
     async function launchRunner(targetId) {
       setBusy(true);
@@ -1617,6 +1837,42 @@ function createServer(targets = loadTargets(), options = {}) {
         return;
       }
 
+      if (requestUrl.pathname === '/api/github/owners' && req.method === 'GET') {
+        const targetId = requestUrl.searchParams.get('targetId');
+        if (!targetId) {
+          sendJson(res, 400, { error: 'Missing targetId' });
+          return;
+        }
+        const target = targetMap.get(targetId);
+        if (!target) {
+          sendJson(res, 404, { error: `Unknown target ${targetId}` });
+          return;
+        }
+
+        const q = String(requestUrl.searchParams.get('q') || '').trim();
+        const ownerNames = await githubOwnerSuggestions(target.accessToken, q);
+        sendJson(res, 200, ownerNames);
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/github/repos' && req.method === 'GET') {
+        const targetId = requestUrl.searchParams.get('targetId');
+        const owner = String(requestUrl.searchParams.get('owner') || '').trim();
+        if (!targetId || !owner) {
+          sendJson(res, 400, { error: 'Missing targetId or owner' });
+          return;
+        }
+        const target = targetMap.get(targetId);
+        if (!target) {
+          sendJson(res, 404, { error: `Unknown target ${targetId}` });
+          return;
+        }
+        const q = String(requestUrl.searchParams.get('q') || '').trim();
+        const repos = await githubRepoSuggestions(target.accessToken, owner, q);
+        sendJson(res, 200, repos);
+        return;
+      }
+
       const status = await getStatus(targets);
       if (requestUrl.pathname === '/api/status') {
         sendJson(res, 200, status);
@@ -1658,4 +1914,11 @@ module.exports = {
   shouldRemoveManagedStack,
   slugify,
   targetHasRepoFeed,
+  filterAutocompleteValues,
+  githubOwnerSuggestions,
+  githubRepoSuggestions,
+  githubCached,
+  githubCacheKey,
+  githubCacheGet,
+  githubCacheSet,
 };
