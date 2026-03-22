@@ -625,6 +625,7 @@ function buildRunnerContainerSpec(target, runnerName) {
         NetworkMode: `container:${dindContainerNameForStack(stackId)}`,
         Binds: [
           `${runnerVolumeName}:${target.runnerWorkdir}`,
+          'fleet-cache-global:/cache:rw',
         ],
       },
     },
@@ -1397,8 +1398,26 @@ function render(status) {
     a { color: var(--accent); text-decoration: none; }
     .jobs-panel { margin-top: 14px; padding: 12px; border: 1px dashed var(--border); border-radius: 8px; background: var(--surface-muted); min-height: 48px; }
     #action-status { min-height: 20px; }
+    .helper-card { background: linear-gradient(180deg, #ffffff 0%, #f8faf6 100%); }
+    .helper-head-copy { max-width: 720px; }
+    .helper-grid { display: grid; grid-template-columns: minmax(220px, 1.1fr) minmax(220px, 1fr) minmax(220px, 1fr); gap: 14px; align-items: start; }
+    .helper-field { display: grid; grid-template-rows: auto minmax(44px, auto) auto; gap: 6px; align-content: start; }
+    .helper-label { display: block; color: var(--muted); font-size: 12px; }
+    .helper-input,
+    .helper-select { width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; font: inherit; line-height: 1.35; background: var(--surface); color: var(--text); appearance: none; }
+    .helper-input:focus,
+    .helper-select:focus { outline: 2px solid rgba(40, 85, 64, 0.16); border-color: #98b29f; }
+    .helper-input:disabled { background: #f0f1ec; color: #8a9088; }
+    .helper-hint { font-size: 12px; line-height: 1.4; color: var(--muted); min-height: 34px; }
+    .helper-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+    .helper-actions button { min-width: 140px; }
+    .helper-summary { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+    .helper-summary .pill { margin: 0; }
+    .helper-status { margin-top: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); min-height: 48px; display: flex; align-items: center; }
+    .helper-status[data-tone="error"] { color: var(--danger); border-color: #efc4bc; background: var(--danger-soft); }
+    .helper-status[data-tone="success"] { color: var(--accent); border-color: #c8dccf; background: var(--accent-soft); }
     @media (max-width: 1024px) {
-      .overview, .summary-strip, .panel-grid, .meta-grid { grid-template-columns: 1fr; }
+      .overview, .summary-strip, .panel-grid, .meta-grid, .helper-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1415,34 +1434,44 @@ function render(status) {
       <section class="metric"><span>Ephemeral runner stacks</span><strong>${managedCount}</strong></section>
       <section class="metric"><span>Registered runners</span><strong>${registeredCount}</strong></section>
     </section>
-    <section class="card">
+    <section class="card helper-card">
       <div class="section-head section-head-tight">
-        <h2>Target navigation helper</h2>
+        <div class="helper-head-copy">
+          <h2>Target navigation helper</h2>
+          <p class="muted compact">Use one target token as your navigation context, then pick an owner and repo that actually belong to that token's reachable scope.</p>
+        </div>
       </div>
-      <div class="meta-grid">
-        <label>
-          <span class="meta-label">Target (token provider)</span>
-          <select id="github-target" style="width:100%;" aria-label="Github target selector">
-            ${status.targets.map((target) => `<option value="${escapeHtml(target.id)}">${escapeHtml(target.name)} (${escapeHtml(target.id)})</option>`).join('')}
+      <div class="helper-summary">
+        <span id="github-target-scope" class="pill">Scope</span>
+        <span id="github-target-feed" class="pill">Run feed</span>
+      </div>
+      <div class="helper-grid">
+        <label class="helper-field">
+          <span class="helper-label">Target (token provider)</span>
+          <select id="github-target" class="helper-select" aria-label="Github target selector">
+            ${status.targets.map((target) => `<option value="${escapeHtml(target.id)}" data-scope="${escapeHtml(target.scope)}" data-repo="${escapeHtml(target.repository || '')}" data-owner="${escapeHtml(target.owner || '')}" data-name="${escapeHtml(target.name)}">${escapeHtml(target.name)} (${escapeHtml(target.id)})</option>`).join('')}
           </select>
+          <span class="helper-hint">Changing target changes the owner/repo universe used by autocomplete.</span>
         </label>
-        <label>
-          <span class="meta-label">Owner / Org</span>
-          <input id="github-owner" list="owner-options" type="search" placeholder="Start typing owner/org" autocomplete="off" style="width:100%;" />
+        <label class="helper-field">
+          <span class="helper-label">Owner / Org</span>
+          <input id="github-owner" class="helper-input" list="owner-options" type="search" placeholder="Start typing owner/org" autocomplete="off" />
           <datalist id="owner-options"></datalist>
+          <span class="helper-hint">Only owners reachable by the selected token appear here.</span>
         </label>
-        <label>
-          <span class="meta-label">Repo</span>
-          <input id="github-repo" list="repo-options" type="search" placeholder="Start typing repo" autocomplete="off" style="width:100%;" disabled />
+        <label class="helper-field">
+          <span class="helper-label">Repo</span>
+          <input id="github-repo" class="helper-input" list="repo-options" type="search" placeholder="Start typing repo" autocomplete="off" disabled />
           <datalist id="repo-options"></datalist>
+          <span class="helper-hint">Repo suggestions stay inside the chosen owner.</span>
         </label>
       </div>
-      <div class="toolbar" style="margin-top:8px;">
+      <div class="helper-actions">
         <button id="github-refresh-owners">Refresh owners</button>
         <button id="github-refresh-repos" disabled>Refresh repos</button>
         <button id="github-copy-snippet">Copy RUNNER_TARGETS_JSON snippet</button>
       </div>
-      <div id="github-helper-status" class="muted">Use this panel to find owner/org + repo names with GitHub-backed autocomplete and get copy/paste target JSON.</div>
+      <div id="github-helper-status" class="helper-status muted" data-tone="idle">Use this panel to find owner/org + repo names with GitHub-backed autocomplete and get copy/paste target JSON.</div>
     </section>
     <section class="card">
       <div class="section-head section-head-tight">
@@ -1460,6 +1489,17 @@ function render(status) {
   </main>
   <script>
     const statusNode = document.getElementById('action-status');
+    const githubTargetNode = document.getElementById('github-target');
+    const githubOwnerNode = document.getElementById('github-owner');
+    const githubRepoNode = document.getElementById('github-repo');
+    const githubOwnerListNode = document.getElementById('owner-options');
+    const githubRepoListNode = document.getElementById('repo-options');
+    const githubRefreshReposNode = document.getElementById('github-refresh-repos');
+    const githubHelperStatusNode = document.getElementById('github-helper-status');
+    const githubTargetScopeNode = document.getElementById('github-target-scope');
+    const githubTargetFeedNode = document.getElementById('github-target-feed');
+    let ownerLookupTimer = null;
+    let repoLookupTimer = null;
 
     function setBusy(disabled) {
       Array.from(document.querySelectorAll('button[data-action]')).forEach((item) => { item.disabled = disabled; });
@@ -1486,20 +1526,49 @@ function render(status) {
     }
 
     function setGithubHelperStatus(message, isError = false) {
-      const node = document.getElementById('github-helper-status');
-      node.textContent = message;
-      node.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+      githubHelperStatusNode.textContent = message;
+      githubHelperStatusNode.dataset.tone = isError ? 'error' : 'success';
+      if (!message) {
+        githubHelperStatusNode.dataset.tone = 'idle';
+      }
     }
 
-    async function refreshOwnerOptions() {
-      const targetId = document.getElementById('github-target').value;
+    function resetGithubHelperStatus(message) {
+      githubHelperStatusNode.dataset.tone = 'idle';
+      githubHelperStatusNode.textContent = message;
+    }
+
+    function selectedTargetOption() {
+      return githubTargetNode.options[githubTargetNode.selectedIndex];
+    }
+
+    function updateTargetMeta() {
+      const option = selectedTargetOption();
+      githubTargetScopeNode.textContent = 'Scope: ' + (option?.dataset.scope || '-');
+      githubTargetFeedNode.textContent = option?.dataset.repo
+        ? 'Run feed: ' + option.dataset.repo
+        : 'Run feed: not configured';
+    }
+
+    function fillDataList(node, values) {
+      node.innerHTML = values.map(function(value) {
+        return '<option value="' + value + '"></option>';
+      }).join('');
+    }
+
+    function resetRepoSelection() {
+      githubRepoNode.value = '';
+      githubRepoNode.disabled = true;
+      githubRefreshReposNode.disabled = true;
+      fillDataList(githubRepoListNode, []);
+    }
+
+    async function refreshOwnerOptions(query = '') {
+      const targetId = githubTargetNode.value;
       setGithubHelperStatus('Loading owner/org list...');
       try {
-        const owners = await githubFetchOwners(targetId);
-        const ownerDataList = document.getElementById('owner-options');
-        ownerDataList.innerHTML = owners.map(function(owner) {
-          return '<option value="' + owner + '"></option>';
-        }).join('');
+        const owners = await githubFetchOwners(targetId, query.trim());
+        fillDataList(githubOwnerListNode, owners);
         setGithubHelperStatus('Loaded ' + owners.length + ' owner(s).');
       } catch (error) {
         setGithubHelperStatus('Owner lookup failed: ' + error.message, true);
@@ -1507,28 +1576,30 @@ function render(status) {
     }
 
     async function refreshRepoOptions() {
-      const targetId = document.getElementById('github-target').value;
-      const owner = document.getElementById('github-owner').value.trim();
+      const targetId = githubTargetNode.value;
+      const owner = githubOwnerNode.value.trim();
       if (!owner) {
-        setGithubHelperStatus('Select owner/org first.');
+        resetRepoSelection();
+        resetGithubHelperStatus('Select owner/org first.');
         return;
       }
       setGithubHelperStatus('Loading repos for ' + owner + '...');
       try {
-        const repos = await githubFetchRepos(targetId, owner);
-        const repoDataList = document.getElementById('repo-options');
-        repoDataList.innerHTML = repos.map(function(repo) { return '<option value="' + repo + '"></option>'; }).join('');
-        document.getElementById('github-repo').disabled = false;
+        const repos = await githubFetchRepos(targetId, owner, githubRepoNode.value.trim());
+        fillDataList(githubRepoListNode, repos);
+        githubRepoNode.disabled = repos.length === 0;
+        githubRefreshReposNode.disabled = false;
         setGithubHelperStatus('Loaded ' + repos.length + ' repos for ' + owner + '.');
       } catch (error) {
+        resetRepoSelection();
         setGithubHelperStatus('Repo lookup failed: ' + error.message, true);
       }
     }
 
     function createRunnerTargetSnippet() {
-      const targetId = document.getElementById('github-target').value;
-      const owner = document.getElementById('github-owner').value.trim();
-      const repo = document.getElementById('github-repo').value.trim();
+      const targetId = githubTargetNode.value;
+      const owner = githubOwnerNode.value.trim();
+      const repo = githubRepoNode.value.trim();
       if (!owner) {
         setGithubHelperStatus('Owner is required to build snippet.', true);
         return;
@@ -1549,12 +1620,30 @@ function render(status) {
       });
     }
 
-    document.getElementById('github-target').addEventListener('change', () => {
-      refreshOwnerOptions();
+    function scheduleOwnerLookup() {
+      clearTimeout(ownerLookupTimer);
+      ownerLookupTimer = window.setTimeout(() => {
+        refreshOwnerOptions(githubOwnerNode.value).catch(() => {});
+      }, 180);
+    }
+
+    function scheduleRepoLookup() {
+      clearTimeout(repoLookupTimer);
+      repoLookupTimer = window.setTimeout(() => {
+        refreshRepoOptions().catch(() => {});
+      }, 180);
+    }
+
+    githubTargetNode.addEventListener('change', () => {
+      githubOwnerNode.value = '';
+      updateTargetMeta();
+      fillDataList(githubOwnerListNode, []);
+      resetRepoSelection();
+      refreshOwnerOptions().catch(() => {});
     });
 
     document.getElementById('github-refresh-owners').addEventListener('click', () => {
-      refreshOwnerOptions();
+      refreshOwnerOptions(githubOwnerNode.value);
     });
 
     document.getElementById('github-refresh-repos').addEventListener('click', () => {
@@ -1565,17 +1654,46 @@ function render(status) {
       createRunnerTargetSnippet();
     });
 
-    document.getElementById('github-owner').addEventListener('input', () => {
-      const owner = document.getElementById('github-owner').value.trim();
-      document.getElementById('github-refresh-repos').disabled = owner === '';
+    githubOwnerNode.addEventListener('focus', () => {
+      if (!githubOwnerListNode.children.length) {
+        refreshOwnerOptions(githubOwnerNode.value).catch(() => {});
+      }
     });
 
-    document.getElementById('github-repo').addEventListener('input', () => {
-      const owner = document.getElementById('github-owner').value.trim();
-      const repo = document.getElementById('github-repo').value;
-      setGithubHelperStatus(owner ? 'Selecting ' + owner + '/' + repo : 'Select owner/org first.');
+    githubOwnerNode.addEventListener('input', () => {
+      const owner = githubOwnerNode.value.trim();
+      githubRefreshReposNode.disabled = owner === '';
+      resetRepoSelection();
+      if (!owner) {
+        resetGithubHelperStatus('Type an owner/org reachable by the selected token.');
+        return;
+      }
+      scheduleOwnerLookup();
+      scheduleRepoLookup();
     });
 
+    githubRepoNode.addEventListener('focus', () => {
+      if (githubOwnerNode.value.trim()) {
+        refreshRepoOptions().catch(() => {});
+      }
+    });
+
+    githubRepoNode.addEventListener('input', () => {
+      const owner = githubOwnerNode.value.trim();
+      const repo = githubRepoNode.value.trim();
+      if (!owner) {
+        resetGithubHelperStatus('Select owner/org first.');
+        return;
+      }
+      if (!repo) {
+        resetGithubHelperStatus('Loaded repo list for ' + owner + '.');
+        return;
+      }
+      scheduleRepoLookup();
+      resetGithubHelperStatus('Selecting ' + owner + '/' + repo + '.');
+    });
+
+    updateTargetMeta();
     refreshOwnerOptions().catch(() => {});
 
     async function launchRunner(targetId) {
