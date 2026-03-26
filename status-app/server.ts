@@ -38,6 +38,9 @@ const DATA_DIR = process.env.DATA_DIR || '/app/data';
 const TARGETS_FILE = path.join(DATA_DIR, 'targets.json');
 const AUTOCOMPLETE_CACHE_TTL_MS = Number.parseInt(process.env.AUTOCOMPLETE_CACHE_TTL_MS || '60000', 10);
 const AUTOCOMPLETE_CACHE_MAX_ENTRIES = Math.max(20, Number.parseInt(process.env.AUTOCOMPLETE_CACHE_MAX_ENTRIES || '200', 10));
+const GITHUB_STATUS_CACHE_TTL_MS = Number.parseInt(process.env.GITHUB_STATUS_CACHE_TTL_MS || '15000', 10);
+const STATUS_CACHE_TTL_MS = Number.parseInt(process.env.STATUS_CACHE_TTL_MS || '10000', 10);
+const RUNNER_RESOURCE_CACHE_TTL_MS = Number.parseInt(process.env.RUNNER_RESOURCE_CACHE_TTL_MS || '30000', 10);
 
 const MANAGED_LABEL = 'io.github-runner-fleet.managed';
 const MANAGED_TARGET_LABEL = 'io.github-runner-fleet.target-id';
@@ -53,6 +56,15 @@ function resolveClientDistDir() {
 }
 
 const CLIENT_DIST_DIR = resolveClientDistDir();
+const githubStatusCache = new Map();
+const runnerResourceCache = new Map();
+const runnerResourceRefreshes = new Map();
+const statusSnapshotCache = {
+  key: '',
+  value: null,
+  expiresAt: 0,
+  pending: null,
+};
 
 /* ── Utilities ──────────────────────────────────────────────────────── */
 
@@ -114,6 +126,24 @@ function parseListenPort(value) {
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
+function readTimedCache(cache, key, now = Date.now()) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= now) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function writeTimedCache(cache, key, value, ttlMs, now = Date.now()) {
+  cache.set(key, {
+    value,
+    expiresAt: now + Math.max(1000, ttlMs),
+  });
+  return value;
+}
+
 /* ── Small In-Memory Cache ─────────────────────────────────────────── */
 
 const autocompleteCache = new Map();
@@ -150,6 +180,93 @@ function writeAutocompleteCache(key, value, ttlMs = AUTOCOMPLETE_CACHE_TTL_MS, n
 
 function clearAutocompleteCache() {
   autocompleteCache.clear();
+}
+
+function buildGithubStatusCacheKey(token, ghPath) {
+  return `${hashToken(token)}::${ghPath}`;
+}
+
+function readGithubStatusCache(token, ghPath, now = Date.now()) {
+  return readTimedCache(githubStatusCache, buildGithubStatusCacheKey(token, ghPath), now);
+}
+
+function writeGithubStatusCache(token, ghPath, value, ttlMs = GITHUB_STATUS_CACHE_TTL_MS, now = Date.now()) {
+  return writeTimedCache(githubStatusCache, buildGithubStatusCacheKey(token, ghPath), value, ttlMs, now);
+}
+
+function clearGithubStatusCache() {
+  githubStatusCache.clear();
+}
+
+async function githubCached(token, ghPath, ttlMs = GITHUB_STATUS_CACHE_TTL_MS, now = Date.now()) {
+  const cached = readGithubStatusCache(token, ghPath, now);
+  if (cached) return cached;
+  const value = await github(token, ghPath);
+  return writeGithubStatusCache(token, ghPath, value, ttlMs, now);
+}
+
+function readRunnerResourceCache(containerId, now = Date.now()) {
+  return readTimedCache(runnerResourceCache, containerId, now);
+}
+
+function writeRunnerResourceCache(containerId, value, ttlMs = RUNNER_RESOURCE_CACHE_TTL_MS, now = Date.now()) {
+  return writeTimedCache(runnerResourceCache, containerId, value, ttlMs, now);
+}
+
+function clearRunnerResourceCache() {
+  runnerResourceCache.clear();
+  runnerResourceRefreshes.clear();
+}
+
+function computeRunnerResourceUsage(stats, inspect) {
+  const cpuUsage = (stats?.cpu_stats?.cpu_usage?.total_usage || 0) - (stats?.precpu_stats?.cpu_usage?.total_usage || 0);
+  const systemUsage = (stats?.cpu_stats?.system_cpu_usage || 0) - (stats?.precpu_stats?.system_cpu_usage || 0);
+  const onlineCpus = stats?.cpu_stats?.online_cpus || stats?.cpu_stats?.cpu_usage?.percpu_usage?.length || 1;
+  const cpuPercent = systemUsage > 0 ? (cpuUsage / systemUsage) * onlineCpus * 100 : 0;
+
+  return {
+    cpuPercent,
+    memoryBytes: stats?.memory_stats?.usage || 0,
+    memoryLimitBytes: stats?.memory_stats?.limit || 0,
+    diskBytes: inspect?.SizeRw || 0,
+  };
+}
+
+async function refreshRunnerResourceUsage(containerId) {
+  const inFlight = runnerResourceRefreshes.get(containerId);
+  if (inFlight) return inFlight;
+
+  const refresh = (async () => {
+    try {
+      const [stats, inspect] = await Promise.all([
+        readContainerStats(containerId),
+        inspectContainerWithSize(containerId),
+      ]);
+      return writeRunnerResourceCache(containerId, computeRunnerResourceUsage(stats, inspect));
+    } finally {
+      runnerResourceRefreshes.delete(containerId);
+    }
+  })();
+
+  runnerResourceRefreshes.set(containerId, refresh);
+  return refresh;
+}
+
+function buildStatusCacheKey(targets) {
+  return JSON.stringify((Array.isArray(targets) ? targets : []).map((target) => [
+    target.id,
+    target.scope,
+    target.owner,
+    target.repo,
+    target.runnersCount,
+  ]));
+}
+
+function clearStatusSnapshotCache() {
+  statusSnapshotCache.key = '';
+  statusSnapshotCache.value = null;
+  statusSnapshotCache.expiresAt = 0;
+  statusSnapshotCache.pending = null;
 }
 
 async function withAutocompleteCache(key, loader, ttlMs = AUTOCOMPLETE_CACHE_TTL_MS, now = Date.now()) {
@@ -622,6 +739,8 @@ async function removeStack(sId) {
   const containers = await listManagedContainers();
   const matching = containers.filter((c) => c.Labels?.[MANAGED_STACK_LABEL] === sId);
   for (const c of matching) {
+    runnerResourceCache.delete(c.Id);
+    runnerResourceRefreshes.delete(c.Id);
     await removeContainerForce(c.Id).catch(() => {});
   }
 
@@ -636,33 +755,19 @@ async function removeStack(sId) {
   }
 }
 
-async function getRunnerContainerState(targetId, index) {
+async function getRunnerContainerState(targetId, index, options: { allContainers?: any[]; match?: any; includeResourceUsage?: boolean } = {}) {
   const name = runnerContainerName(targetId, index);
-  const all = await listAllContainers();
-  const match = all.find((c) => (c.Names || []).some((n) => n === `/${name}` || n === name));
+  const all = options.allContainers || await listAllContainers();
+  const match = options.match || all.find((c) => (c.Names || []).some((n) => n === `/${name}` || n === name));
   if (!match) return null;
 
   let resourceUsage = {};
-  if (match.State === 'running') {
-    try {
-      const [stats, inspect] = await Promise.all([
-        readContainerStats(match.Id),
-        inspectContainerWithSize(match.Id),
-      ]);
-
-      const cpuUsage = (stats?.cpu_stats?.cpu_usage?.total_usage || 0) - (stats?.precpu_stats?.cpu_usage?.total_usage || 0);
-      const systemUsage = (stats?.cpu_stats?.system_cpu_usage || 0) - (stats?.precpu_stats?.system_cpu_usage || 0);
-      const onlineCpus = stats?.cpu_stats?.online_cpus || stats?.cpu_stats?.cpu_usage?.percpu_usage?.length || 1;
-      const cpuPercent = systemUsage > 0 ? (cpuUsage / systemUsage) * onlineCpus * 100 : 0;
-
-      resourceUsage = {
-        cpuPercent,
-        memoryBytes: stats?.memory_stats?.usage || 0,
-        memoryLimitBytes: stats?.memory_stats?.limit || 0,
-        diskBytes: inspect?.SizeRw || 0,
-      };
-    } catch {
-      resourceUsage = {};
+  if (match.State === 'running' && options.includeResourceUsage !== false) {
+    const cachedUsage = readRunnerResourceCache(match.Id);
+    if (cachedUsage) {
+      resourceUsage = cachedUsage;
+    } else {
+      refreshRunnerResourceUsage(match.Id).catch(() => {});
     }
   }
 
@@ -718,10 +823,10 @@ async function stopRunnersForTarget(targetId, runnersCount) {
 async function githubRunnersForTarget(target) {
   try {
     if (target.scope === 'repo') {
-      const payload = await github(target.accessToken, `/repos/${target.owner}/${target.repo}/actions/runners`);
+      const payload = await githubCached(target.accessToken, `/repos/${target.owner}/${target.repo}/actions/runners`);
       return payload.runners || [];
     }
-    const payload = await github(target.accessToken, `/orgs/${target.owner}/actions/runners`);
+    const payload = await githubCached(target.accessToken, `/orgs/${target.owner}/actions/runners`);
     return payload.runners || [];
   } catch {
     return [];
@@ -731,7 +836,7 @@ async function githubRunnersForTarget(target) {
 async function latestRunsForTarget(target) {
   if (!targetHasRepoFeed(target)) return [];
   try {
-    const payload = await github(target.accessToken, `/repos/${target.owner}/${target.repo}/actions/runs?per_page=8`);
+    const payload = await githubCached(target.accessToken, `/repos/${target.owner}/${target.repo}/actions/runs?per_page=8`);
     return (payload.workflow_runs || []).map((run) => ({
       id: run.id, name: run.name, event: run.event, status: run.status,
       conclusion: run.conclusion, url: run.html_url, created_at: run.created_at,
@@ -793,10 +898,22 @@ async function getTargetSnapshot(target) {
     githubRunnersForTarget(target),
     latestRunsForTarget(target),
   ]);
+  const allContainers = await listAllContainers();
+  const containersByName = new Map();
+  for (const container of allContainers) {
+    for (const containerName of (container.Names || [])) {
+      containersByName.set(containerName, container);
+      containersByName.set(containerName.replace(/^\//, ''), container);
+    }
+  }
 
   const localRunners = [];
   for (let i = 0; i < target.runnersCount; i++) {
-    const s = await getRunnerContainerState(target.id, i);
+    const name = runnerContainerName(target.id, i);
+    const s = await getRunnerContainerState(target.id, i, {
+      allContainers,
+      match: containersByName.get(name) || containersByName.get(`/${name}`),
+    });
     localRunners.push(s || { name: runnerContainerName(target.id, i), state: 'not-created', status: 'absent' });
   }
 
@@ -817,6 +934,37 @@ async function getTargetSnapshot(target) {
 async function getStatus(targets) {
   const snapshots = await Promise.all(targets.map(getTargetSnapshot));
   return { generatedAt: new Date().toISOString(), targets: snapshots };
+}
+
+async function getCachedStatus(targets, getStatusFn = getStatus, options: { now?: number; ttlMs?: number } = {}) {
+  const now = options.now ?? Date.now();
+  const ttlMs = options.ttlMs ?? STATUS_CACHE_TTL_MS;
+  const key = buildStatusCacheKey(targets);
+
+  if (statusSnapshotCache.key === key && statusSnapshotCache.value && statusSnapshotCache.expiresAt > now) {
+    return statusSnapshotCache.value;
+  }
+
+  if (statusSnapshotCache.key === key && statusSnapshotCache.pending) {
+    return statusSnapshotCache.pending;
+  }
+
+  const pending = Promise.resolve(getStatusFn(targets))
+    .then((value) => {
+      statusSnapshotCache.key = key;
+      statusSnapshotCache.value = value;
+      statusSnapshotCache.expiresAt = Date.now() + Math.max(1000, ttlMs);
+      return value;
+    })
+    .finally(() => {
+      if (statusSnapshotCache.pending === pending) {
+        statusSnapshotCache.pending = null;
+      }
+    });
+
+  statusSnapshotCache.key = key;
+  statusSnapshotCache.pending = pending;
+  return pending;
 }
 /* c8 ignore stop */
 
@@ -868,6 +1016,8 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
 
     targets.push(target);
     saveTargetsFn(targets);
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
     ensureRunnersForTargetFn(target).catch((error) => console.error('[fleet] launch error:', error.message));
     res.status(201).json(sanitizeTargetForClient(target));
   }));
@@ -882,6 +1032,8 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     await stopRunnersForTargetFn(target.id, target.runnersCount);
     targets = targets.filter((item) => item.id !== target.id);
     saveTargetsFn(targets);
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
     res.json({ removed: target.id });
   }));
 
@@ -894,6 +1046,7 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
 
     await stopRunnersForTargetFn(target.id, target.runnersCount);
     const results = await ensureRunnersForTargetFn(target);
+    clearStatusSnapshotCache();
     res.json(results);
   }));
 
@@ -905,6 +1058,7 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
     }
 
     const results = await ensureRunnersForTargetFn(target);
+    clearStatusSnapshotCache();
     res.json(results);
   }));
 
@@ -925,7 +1079,10 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
       return;
     }
 
-    res.json(await rerunWorkflowRunFn(target, req.params.runId));
+    const result = await rerunWorkflowRunFn(target, req.params.runId);
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
+    res.json(result);
   }));
 
   app.post('/api/targets/:targetId/runs/:runId/cancel', asyncRoute(async (req, res) => {
@@ -935,7 +1092,10 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
       return;
     }
 
-    res.json(await forceCancelRunFn(target, req.params.runId));
+    const result = await forceCancelRunFn(target, req.params.runId);
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
+    res.json(result);
   }));
 
   app.post('/api/targets/:targetId/runs/:runId/rerun-failed', asyncRoute(async (req, res) => {
@@ -945,7 +1105,10 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
       return;
     }
 
-    res.json(await rerunFailedJobsFn(target, req.params.runId));
+    const result = await rerunFailedJobsFn(target, req.params.runId);
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
+    res.json(result);
   }));
 
   app.post('/api/targets/:targetId/jobs/:jobId/rerun', asyncRoute(async (req, res) => {
@@ -955,7 +1118,10 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
       return;
     }
 
-    res.json(await rerunJobFn(target, req.params.jobId));
+    const result = await rerunJobFn(target, req.params.jobId);
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
+    res.json(result);
   }));
 
   app.get('/api/github/owners', asyncRoute(async (req, res) => {
@@ -977,7 +1143,7 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
   }));
 
   app.get('/api/status', asyncRoute(async (_req, res) => {
-    res.json(sanitizeStatusForClient(await getStatusFn(targets)));
+    res.json(sanitizeStatusForClient(await getCachedStatus(targets, getStatusFn)));
   }));
 
   app.use('/api', (_req, res) => {
@@ -1053,6 +1219,9 @@ module.exports = {
   slugify, targetHasRepoFeed, normalizeAutocompleteItems, normalizeAccessibleOwners, resolveAutocompleteToken,
   validateTargetFormInput, buildAutocompleteCacheKey, readAutocompleteCache,
   writeAutocompleteCache, withAutocompleteCache, clearAutocompleteCache,
+  readGithubStatusCache, writeGithubStatusCache, clearGithubStatusCache, githubCached,
+  readRunnerResourceCache, writeRunnerResourceCache, clearRunnerResourceCache,
+  clearStatusSnapshotCache, getCachedStatus, renderClientShellFallback,
   loadPersistedTargets, saveTargets, ensureRunnersForTarget, resolveClientDistDir,
   sanitizeStatusForClient, sanitizeTargetForClient,
 };

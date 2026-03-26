@@ -17,9 +17,18 @@ const {
   writeAutocompleteCache,
   withAutocompleteCache,
   clearAutocompleteCache,
+  readGithubStatusCache,
+  writeGithubStatusCache,
+  clearGithubStatusCache,
+  getCachedStatus,
+  clearStatusSnapshotCache,
+  writeRunnerResourceCache,
+  readRunnerResourceCache,
+  clearRunnerResourceCache,
   loadPersistedTargets,
   saveTargets,
   resolveClientDistDir,
+  renderClientShellFallback,
   sanitizeStatusForClient,
   sanitizeTargetForClient,
 } = require('./server.ts');
@@ -274,6 +283,36 @@ test('withAutocompleteCache only invokes loader once before ttl expiry', async (
   assert.equal(calls, 1);
 });
 
+test('github status cache stores values without exposing the raw token', () => {
+  clearGithubStatusCache();
+  writeGithubStatusCache('secret-token', '/repos/octo/web/actions/runs?per_page=8', { ok: true }, 1200, 1000);
+  assert.deepEqual(
+    readGithubStatusCache('secret-token', '/repos/octo/web/actions/runs?per_page=8', 1001),
+    { ok: true },
+  );
+  assert.equal(
+    readGithubStatusCache('secret-token', '/repos/octo/web/actions/runs?per_page=8', 2205),
+    null,
+  );
+});
+
+test('getCachedStatus only invokes loader once before ttl expiry', async () => {
+  clearStatusSnapshotCache();
+  let calls = 0;
+  const targets = [{ id: 'fleet-a', scope: 'org', owner: 'octo', repo: '', runnersCount: 1 }];
+  const loader = async () => {
+    calls += 1;
+    return { generatedAt: `tick-${calls}`, targets: [{ id: 'fleet-a', calls }] };
+  };
+
+  const first = await getCachedStatus(targets, loader, { now: 1000, ttlMs: 5000 });
+  const second = await getCachedStatus(targets, loader, { now: 1001, ttlMs: 5000 });
+
+  assert.deepEqual(first, { generatedAt: 'tick-1', targets: [{ id: 'fleet-a', calls: 1 }] });
+  assert.deepEqual(second, { generatedAt: 'tick-1', targets: [{ id: 'fleet-a', calls: 1 }] });
+  assert.equal(calls, 1);
+});
+
 /* ── Form validation ─────────────────────────────────────────────── */
 
 test('validateTargetFormInput accepts valid org target input', () => {
@@ -342,26 +381,23 @@ test('loadPersistedTargets returns empty array for missing file', () => {
   process.env.DATA_DIR = origEnv;
 });
 
-test('saveTargets and loadPersistedTargets roundtrip', () => {
-  const origDataDir = process.env.DATA_DIR;
-  const tmpDir = path.join(os.tmpdir(), `fleet-test-${Date.now()}`);
-  fs.mkdirSync(tmpDir, { recursive: true });
+test('runner resource cache clears stored metrics', () => {
+  clearRunnerResourceCache();
+  writeRunnerResourceCache('container-a', { cpuPercent: 12.5 }, 1200, 1000);
+  assert.deepEqual(readRunnerResourceCache('container-a', 1001), { cpuPercent: 12.5 });
+  clearRunnerResourceCache();
+  assert.equal(readRunnerResourceCache('container-a', 1002), null);
+});
 
-  // Override the module internals by temporarily patching DATA_DIR
-  // The functions use the module-level constant, so we test via the file path
-  const targetFile = path.join(tmpDir, 'targets.json');
-  const testData = [{ id: 'test', name: 'Test' }];
-  fs.writeFileSync(targetFile, JSON.stringify(testData), 'utf8');
-
-  const loaded = JSON.parse(fs.readFileSync(targetFile, 'utf8'));
-  assert.deepEqual(loaded, testData);
-
-  // Cleanup
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-  process.env.DATA_DIR = origDataDir;
+test('renderClientShellFallback returns a minimal root container shell', () => {
+  const html = renderClientShellFallback();
+  assert.match(html, /<!doctype html>/i);
+  assert.match(html, /<div id="root"><\/div>/);
 });
 
 test('createServer serves target management and GitHub helper routes', async () => {
+  clearStatusSnapshotCache();
+  clearGithubStatusCache();
   const saveTargetsFn = async () => {};
   const ensureRunnersForTargetFn = async (target) => [{ action: 'launched', targetId: target.id }];
   const stopRunnersForTargetFn = async () => {};
@@ -520,12 +556,15 @@ test('createServer serves target management and GitHub helper routes', async () 
     const appShell = await fetch(`${baseUrl}/dashboard`);
     assert.equal(appShell.status, 200);
   } finally {
+    clearStatusSnapshotCache();
+    clearGithubStatusCache();
     server.close();
     await once(server, 'close');
   }
 });
 
 test('createServer surfaces async route failures as 500 json responses', async () => {
+  clearStatusSnapshotCache();
   const { server, baseUrl } = await startTestServer([], {
     githubOwnerSuggestionsFn: async () => {
       throw new Error('owners failed');
@@ -544,6 +583,67 @@ test('createServer surfaces async route failures as 500 json responses', async (
     assert.equal(result.response.status, 500);
     assert.deepEqual(result.body, { error: 'status failed' });
   } finally {
+    clearStatusSnapshotCache();
+    server.close();
+    await once(server, 'close');
+  }
+});
+
+test('createServer invalidates cached status after target mutations', async () => {
+  clearStatusSnapshotCache();
+  let calls = 0;
+  const getStatusFn = async (targets) => {
+    calls += 1;
+    return {
+      generatedAt: `tick-${calls}`,
+      targets: targets.map((target) => ({ id: target.id })),
+    };
+  };
+
+  const existingTarget = normalizeTarget({
+    id: 'fleet-a',
+    name: 'Fleet A',
+    scope: 'org',
+    owner: 'octo',
+    accessToken: 'target-token',
+    labels: 'self-hosted',
+  });
+
+  const { server, baseUrl } = await startTestServer([existingTarget], {
+    getStatusFn,
+    ensureRunnersForTargetFn: async () => [],
+    saveTargetsFn: async () => {},
+    stopRunnersForTargetFn: async () => {},
+  });
+
+  try {
+    let result = await requestJson(baseUrl, '/api/status');
+    assert.equal(result.response.status, 200);
+    assert.equal(calls, 1);
+
+    result = await requestJson(baseUrl, '/api/status');
+    assert.equal(result.response.status, 200);
+    assert.equal(calls, 1);
+
+    result = await requestJson(baseUrl, '/api/targets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Fleet B',
+        scope: 'org',
+        owner: 'bpf-project',
+        accessToken: 'second-token',
+        labels: 'self-hosted',
+      }),
+    });
+    assert.equal(result.response.status, 201);
+
+    result = await requestJson(baseUrl, '/api/status');
+    assert.equal(result.response.status, 200);
+    assert.equal(calls, 2);
+    assert.deepEqual(result.body.targets, [{ id: 'fleet-a' }, { id: 'fleet-b' }]);
+  } finally {
+    clearStatusSnapshotCache();
     server.close();
     await once(server, 'close');
   }
