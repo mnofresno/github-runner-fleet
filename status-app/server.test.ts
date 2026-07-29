@@ -33,6 +33,7 @@ const {
   renderClientShellFallback,
   sanitizeStatusForClient,
   sanitizeTargetForClient,
+  shouldReconcileOfflineRunner,
 } = require('./server.ts');
 
 const fs = require('fs');
@@ -62,6 +63,17 @@ async function requestJson(baseUrl, path, init = {}) {
   }
   return { response, body };
 }
+
+test('offline running runner is reconciled', () => {
+  assert.equal(shouldReconcileOfflineRunner({ state: 'running' }, { status: 'offline', busy: false }), true);
+  assert.equal(shouldReconcileOfflineRunner({ state: 'running' }, undefined), true);
+});
+
+test('online or busy runner is not reconciled', () => {
+  assert.equal(shouldReconcileOfflineRunner({ state: 'running' }, { status: 'online', busy: false }), false);
+  assert.equal(shouldReconcileOfflineRunner({ state: 'running' }, { status: 'offline', busy: true }), false);
+  assert.equal(shouldReconcileOfflineRunner({ state: 'exited' }, { status: 'offline', busy: false }), false);
+});
 
 /* ── slugify ─────────────────────────────────────────────────────── */
 

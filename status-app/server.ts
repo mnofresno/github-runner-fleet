@@ -1015,17 +1015,22 @@ async function runFleetCleanup(targets, options: any = {}) {
 
 /* ── GitHub Data Fetching (for dashboard) ────────────────────────────── */
 
-async function githubRunnersForTarget(target) {
+async function githubRunnersHealthForTarget(target) {
   try {
     if (target.scope === 'repo') {
       const payload = await githubCached(target.accessToken, `/repos/${target.owner}/${target.repo}/actions/runners`);
-      return payload.runners || [];
+      return { available: true, runners: payload.runners || [] };
     }
     const payload = await githubCached(target.accessToken, `/orgs/${target.owner}/actions/runners`);
-    return payload.runners || [];
+    return { available: true, runners: payload.runners || [] };
   } catch {
-    return [];
+    return { available: false, runners: [] };
   }
+}
+
+async function githubRunnersForTarget(target) {
+  const health = await githubRunnersHealthForTarget(target);
+  return health.runners;
 }
 
 async function latestRunsForTarget(target) {
@@ -1089,10 +1094,11 @@ async function forceCancelRun(target, runId) {
 /* ── Status Snapshot ─────────────────────────────────────────────────── */
 
 async function getTargetSnapshot(target) {
-  const [ghRunners, latestRuns] = await Promise.all([
-    githubRunnersForTarget(target),
+  const [ghHealth, latestRuns] = await Promise.all([
+    githubRunnersHealthForTarget(target),
     latestRunsForTarget(target),
   ]);
+  const ghRunners = ghHealth.runners;
   const allContainers = await listAllContainers();
   const containersByName = new Map();
   for (const container of allContainers) {
@@ -1118,12 +1124,43 @@ async function getTargetSnapshot(target) {
     ...target,
     repository: targetHasRepoFeed(target) ? `${target.owner}/${target.repo}` : target.owner,
     localRunners,
+    githubStatusAvailable: ghHealth.available,
     githubRunners: ghRunners.map((r) => ({
       id: r.id, name: r.name, status: r.status, busy: r.busy,
       labels: (r.labels || []).map((l) => l.name), os: r.os,
     })),
     latestRuns, activeRuns,
   };
+}
+
+async function reconcileOfflineRunners(target, snapshot) {
+  if (!snapshot || snapshot.githubStatusAvailable !== true) {
+    return [];
+  }
+
+  const githubByName = new Map((snapshot.githubRunners || []).map((runner) => [runner.name, runner]));
+  const actions = [];
+
+  for (let index = 0; index < target.runnersCount; index += 1) {
+    const local = snapshot.localRunners?.[index];
+    const githubRunner = githubByName.get(runnerContainerName(target.id, index));
+    if (!shouldReconcileOfflineRunner(local, githubRunner)) {
+      continue;
+    }
+
+    const stack = stackId(target.id, index);
+    await removeStack(stack);
+    const launched = await launchRunnerStack(target, index);
+    actions.push({ targetId: target.id, index, action: 'reconciled-offline', ...launched });
+  }
+
+  return actions;
+}
+
+function shouldReconcileOfflineRunner(localRunner, githubRunner) {
+  if (!localRunner || localRunner.state !== 'running') return false;
+  if (githubRunner?.busy === true || githubRunner?.status === 'online') return false;
+  return true;
 }
 
 async function getStatus(targets) {
@@ -1469,7 +1506,10 @@ function startHealthcheck(targets) {
       return;
     }
     try {
+      const status = await getStatus(targets);
       for (const target of targets) {
+        const snapshot = status.targets.find((item) => item.id === target.id);
+        await reconcileOfflineRunners(target, snapshot);
         await ensureRunnersForTarget(target);
       }
     } catch (error) {
@@ -1524,6 +1564,7 @@ module.exports = {
   readRunnerResourceCache, writeRunnerResourceCache, clearRunnerResourceCache,
   clearStatusSnapshotCache, getCachedStatus, renderClientShellFallback,
   loadPersistedTargets, saveTargets, ensureRunnersForTarget, resolveClientDistDir,
+  shouldReconcileOfflineRunner,
   sanitizeStatusForClient, sanitizeTargetForClient,
   resetCleanupRuntime, snapshotCleanupStatus, runFleetCleanup,
 };
