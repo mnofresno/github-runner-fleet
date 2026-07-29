@@ -115,11 +115,57 @@ describe('TargetCard', () => {
     );
 
     await user.click(screen.getByRole('button', { name: 'Increase runners' }));
-    await user.click(screen.getByRole('button', { name: 'Decrease runners' }));
+    await user.click(screen.getByRole('button', { name: 'Increase runners' }));
 
-    expect(api.updateTarget).toHaveBeenNthCalledWith(1, 'fleet-a', { runnersCount: 3 });
-    expect(api.updateTarget).toHaveBeenNthCalledWith(2, 'fleet-a', { runnersCount: 1 });
-    expect(onRefresh).toHaveBeenCalledTimes(2);
+    expect(api.updateTarget).not.toHaveBeenCalled();
+    await waitFor(() => expect(api.updateTarget).toHaveBeenCalledWith('fleet-a', { runnersCount: 4 }), { timeout: 1000 });
+    expect(api.updateTarget).toHaveBeenCalledTimes(1);
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps capacity at one runner and disables controls while busy', () => {
+    const { rerender } = render(
+      <TargetCard
+        target={baseTarget}
+        busy={false}
+        onBusyChange={onBusyChange}
+        onStatusChange={onStatusChange}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Decrease runners' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Increase runners' })).not.toBeDisabled();
+
+    rerender(
+      <TargetCard
+        target={baseTarget}
+        busy={true}
+        onBusyChange={onBusyChange}
+        onStatusChange={onStatusChange}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Decrease runners' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Increase runners' })).toBeDisabled();
+  });
+
+  it('commits the singular runner capacity after the debounce window', async () => {
+    const user = userEvent.setup();
+    render(
+      <TargetCard
+        target={{ ...baseTarget, runnersCount: 2 }}
+        busy={false}
+        onBusyChange={onBusyChange}
+        onStatusChange={onStatusChange}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Decrease runners' }));
+    await waitFor(() => expect(api.updateTarget).toHaveBeenCalledWith('fleet-a', { runnersCount: 1 }), { timeout: 1000 });
+    expect(onStatusChange).toHaveBeenCalledWith('Updating fleet-a capacity to 1 runner...');
   });
 
   it('loads jobs and reruns a job from the jobs panel', async () => {
