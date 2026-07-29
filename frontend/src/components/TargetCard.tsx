@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import type { Target, WorkflowJob, WorkflowRun } from '../types';
 
@@ -113,10 +113,17 @@ function RunActions({
 
 export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefresh }: TargetCardProps) {
   const [jobs, setJobs] = useState<WorkflowJob[] | null>(null);
+  const [pendingRunnersCount, setPendingRunnersCount] = useState<number | null>(null);
+  const runnersUpdateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const running = target.localRunners.filter((runner) => runner.state === 'running').length;
   const registered = target.githubRunners.length;
   const busyCount = target.githubRunners.filter((runner) => runner.busy).length;
+  const displayedRunnersCount = pendingRunnersCount ?? target.runnersCount;
+
+  useEffect(() => () => {
+    if (runnersUpdateTimer.current) clearTimeout(runnersUpdateTimer.current);
+  }, []);
 
   async function restartTarget() {
     onBusyChange(true);
@@ -175,11 +182,7 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
     }
   }
 
-  async function updateRunnersCount(nextRunnersCount: number) {
-    if (nextRunnersCount === target.runnersCount || nextRunnersCount < 1) {
-      return;
-    }
-
+  async function commitRunnersCount(nextRunnersCount: number) {
     onBusyChange(true);
     onStatusChange(`Updating ${target.id} capacity to ${nextRunnersCount} runner${nextRunnersCount === 1 ? '' : 's'}...`);
     try {
@@ -189,9 +192,34 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
     } catch (error) {
       onStatusChange(`Failed: ${(error as Error).message}`);
     } finally {
+      setPendingRunnersCount(null);
       onBusyChange(false);
     }
   }
+
+  function updateRunnersCount(nextRunnersCount: number) {
+    if (nextRunnersCount === displayedRunnersCount || nextRunnersCount < 1) {
+      return;
+    }
+
+    setPendingRunnersCount(nextRunnersCount);
+    onStatusChange(`Capacity pending: ${nextRunnersCount} runner${nextRunnersCount === 1 ? '' : 's'}...`);
+    if (runnersUpdateTimer.current) clearTimeout(runnersUpdateTimer.current);
+    runnersUpdateTimer.current = setTimeout(() => {
+      runnersUpdateTimer.current = null;
+      void commitRunnersCount(nextRunnersCount);
+    }, 500);
+  }
+
+  function runnerCountButtonDisabled(nextRunnersCount: number) {
+    return busy || nextRunnersCount < 1;
+  }
+
+  useEffect(() => {
+    if (pendingRunnersCount !== null && target.runnersCount === pendingRunnersCount) {
+      setPendingRunnersCount(null);
+    }
+  }, [pendingRunnersCount, target.runnersCount]);
 
   const resources = summarizeRunnerResources(target);
 
@@ -216,17 +244,17 @@ export function TargetCard({ target, busy, onBusyChange, onStatusChange, onRefre
             <button
               type="button"
               aria-label="Decrease runners"
-              disabled={busy || target.runnersCount <= 1}
-              onClick={() => void updateRunnersCount(target.runnersCount - 1)}
+              disabled={runnerCountButtonDisabled(displayedRunnersCount - 1)}
+              onClick={() => updateRunnersCount(displayedRunnersCount - 1)}
             >
               -
             </button>
-            <strong>{running}/{target.runnersCount}</strong>
+            <strong>{running}/{displayedRunnersCount}</strong>
             <button
               type="button"
               aria-label="Increase runners"
-              disabled={busy}
-              onClick={() => void updateRunnersCount(target.runnersCount + 1)}
+              disabled={runnerCountButtonDisabled(displayedRunnersCount + 1)}
+              onClick={() => updateRunnersCount(displayedRunnersCount + 1)}
             >
               +
             </button>
