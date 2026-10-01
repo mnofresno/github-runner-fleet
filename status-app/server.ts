@@ -1502,18 +1502,20 @@ function createServer(initialTargets, options: CreateServerOptions = {}) {
 
 function startHealthcheck(targets) {
   return setInterval(async () => {
-    if (cleanupRuntime.maintenanceRunning) {
-      return;
-    }
-    try {
+    const result = await withCleanupLock(cleanupRuntime, async () => {
       const status = await getStatus(targets);
       for (const target of targets) {
         const snapshot = status.targets.find((item) => item.id === target.id);
         await reconcileOfflineRunners(target, snapshot);
         await ensureRunnersForTarget(target);
       }
-    } catch (error) {
+      return { done: true };
+    }).catch((error) => {
       console.error('[fleet] healthcheck error:', error.message);
+      return { done: true };
+    });
+    if (!result || result.skipped) {
+      return;
     }
   }, HEALTHCHECK_INTERVAL_MS);
 }
