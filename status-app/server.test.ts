@@ -69,6 +69,15 @@ test('offline running runner is reconciled', () => {
   assert.equal(shouldReconcileOfflineRunner({ state: 'running' }, undefined), true);
 });
 
+test('offline runner gets ten minutes to register and update', () => {
+  const created = 1_790_000_000;
+  const runner = { state: 'running', created };
+  const offline = { status: 'offline', busy: false };
+  assert.equal(shouldReconcileOfflineRunner(runner, offline, created * 1000 + 599_999), false);
+  assert.equal(shouldReconcileOfflineRunner(runner, undefined, created * 1000 + 60_000), false);
+  assert.equal(shouldReconcileOfflineRunner(runner, offline, created * 1000 + 600_000), true);
+});
+
 test('online or busy runner is not reconciled', () => {
   assert.equal(shouldReconcileOfflineRunner({ state: 'running' }, { status: 'online', busy: false }), false);
   assert.equal(shouldReconcileOfflineRunner({ state: 'running' }, { status: 'offline', busy: true }), false);

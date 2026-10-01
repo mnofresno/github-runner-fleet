@@ -738,8 +738,9 @@ async function launchRunnerStack(target, index) {
     `RUNNER_NAME=${rName}`,
     `RUNNER_WORKDIR=${target.runnerWorkdir}`,
     `LABELS=${labels.join(',')}`,
-    'EPHEMERAL=false',
-    'DISABLE_AUTO_UPDATE=true',
+    // The image treats any nonempty value (including "false") as enabled.
+    'EPHEMERAL=',
+    'DISABLE_AUTO_UPDATE=',
     'RANDOM_RUNNER_SUFFIX=false',
     'DOCKER_HOST=tcp://127.0.0.1:2375',
   ];
@@ -1157,9 +1158,11 @@ async function reconcileOfflineRunners(target, snapshot) {
   return actions;
 }
 
-function shouldReconcileOfflineRunner(localRunner, githubRunner) {
+function shouldReconcileOfflineRunner(localRunner, githubRunner, now = Date.now()) {
   if (!localRunner || localRunner.state !== 'running') return false;
   if (githubRunner?.busy === true || githubRunner?.status === 'online') return false;
+  // Allow registration and automatic runner updates to finish before recycling.
+  if (localRunner.created && now - localRunner.created * 1000 < 10 * 60 * 1000) return false;
   return true;
 }
 
