@@ -776,6 +776,11 @@ async function launchRunnerStack(target, index) {
 
     const runnerId = await createContainer(rName, {
       Image: target.runnerImage,
+      // The image entrypoint changes directories while configuring the runner.
+      // Use an absolute executable path so the final CMD does not depend on
+      // the entrypoint's current working directory.
+      WorkingDir: '/actions-runner',
+      Cmd: ['/actions-runner/bin/Runner.Listener', 'run', '--startuptype', 'service'],
       Env: runnerEnv,
       Labels: buildLabels(target, rName, 'runner', sId),
       HostConfig: {
@@ -1162,7 +1167,10 @@ function shouldReconcileOfflineRunner(localRunner, githubRunner, now = Date.now(
   if (!localRunner || localRunner.state !== 'running') return false;
   if (githubRunner?.busy === true || githubRunner?.status === 'online') return false;
   // Allow registration and automatic runner updates to finish before recycling.
-  if (localRunner.created && now - localRunner.created * 1000 < 10 * 60 * 1000) return false;
+  const createdAt = typeof localRunner.created === 'number'
+    ? (localRunner.created > 1e12 ? localRunner.created : localRunner.created * 1000)
+    : Date.parse(localRunner.created || '');
+  if (Number.isFinite(createdAt) && now - createdAt < 10 * 60 * 1000) return false;
   return true;
 }
 
